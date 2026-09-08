@@ -87,6 +87,30 @@ type ConformanceResponse struct {
 	Body   []byte
 }
 
+// IsolationShape is HOW an endpoint denies cross-account access. There are two
+// genuinely different shapes, and a single assertion cannot cover both — that is
+// what made an earlier version of this test wrong (it asserted a denial status
+// on listAssets, whose correct isolation behavior is a 200 that simply contains
+// none of the other account's data).
+type IsolationShape int
+
+const (
+	// ShapeDenyTarget: the endpoint targets a specific resource by id. Account A
+	// reaching a B-owned resource must be DENIED (403/404), and B's data must not
+	// appear in the body. This is the majority shape.
+	ShapeDenyTarget IsolationShape = iota
+
+	// ShapeScopedEnumeration: the endpoint lists the caller's OWN resources and
+	// has no cross-account target. Correct isolation is a 200 whose result set
+	// contains ONLY the caller's data — never a denial. This is where the classic
+	// leak lives: a list query that forgets `WHERE account = $claim` and returns
+	// everyone's rows. So the assertion is the leak check, asserted in BOTH
+	// directions: B's data absent AND the caller's own data present (or an
+	// implementation that returns an empty list for everyone would pass for the
+	// wrong reason).
+	ShapeScopedEnumeration
+)
+
 // EndpointID names each account-scoped operation from the contract, so the test
 // table is exhaustive and a newly-added endpoint that is not covered is visible.
 type EndpointID string
@@ -138,17 +162,23 @@ func SetAccountScopedService(s AccountScopedService) { registeredService = s }
 // registered yet (the conformance test then skips-pending rather than passing).
 func RegisteredService() AccountScopedService { return registeredService }
 
-// AllAccountScopedEndpoints is the exhaustive list of endpoints that target a
-// resource owned by an account — every secured operation EXCEPT createUpload,
-// which has no target (it is covered by the MintUploadKey property instead). If
-// the contract grows an account-scoped endpoint, add it here; the test asserts
-// this list against the contract's operation set so an omission is visible.
+// AllAccountScopedEndpoints is the exhaustive list of endpoints that carry an
+// account-isolation property — every secured operation EXCEPT createUpload,
+// which has no target and no result set (it is covered by the MintUploadKey
+// key-prefix property instead). If the contract grows an account-scoped
+// endpoint, add it here; the coverage test asserts this list against the
+// contract's operation set so an omission is visible.
+//
+// Each endpoint carries its IsolationShape (see ShapeOf) so the conformance test
+// picks the right assertion. Both shapes count as coverage: dropping listAssets
+// to escape the deny-status mismatch would remove the endpoint MOST prone to the
+// classic list leak — the opposite of what "at every endpoint" wants.
 func AllAccountScopedEndpoints() []EndpointID {
 	return []EndpointID{
 		EpResolveDeliveryUrl,
 		EpGetAsset,
 		EpDeleteAsset,
-		EpListAssets,
+		EpListAssets, // ShapeScopedEnumeration — 200 with only the caller's own data
 		EpRequestRendition,
 		EpGetJob,
 		EpFinalizeUpload,
@@ -156,6 +186,29 @@ func AllAccountScopedEndpoints() []EndpointID {
 		EpGetGrant,
 		EpRevokeGrant,
 	}
+}
+
+// endpointShapes maps each account-scoped endpoint to how it denies cross-account
+// access. Everything targets a resource by id (ShapeDenyTarget) except the
+// enumeration endpoints, which deny by returning only the caller's own rows.
+var endpointShapes = map[EndpointID]IsolationShape{
+	EpResolveDeliveryUrl: ShapeDenyTarget,
+	EpGetAsset:           ShapeDenyTarget,
+	EpDeleteAsset:        ShapeDenyTarget,
+	EpListAssets:         ShapeScopedEnumeration,
+	EpRequestRendition:   ShapeDenyTarget,
+	EpGetJob:             ShapeDenyTarget,
+	EpFinalizeUpload:     ShapeDenyTarget,
+	EpCreateGrant:        ShapeDenyTarget,
+	EpGetGrant:           ShapeDenyTarget,
+	EpRevokeGrant:        ShapeDenyTarget,
+}
+
+// ShapeOf returns an endpoint's isolation shape, defaulting to ShapeDenyTarget
+// (the safe assumption: a new endpoint is presumed to target a resource that
+// must be denied cross-account, until it is explicitly declared an enumeration).
+func ShapeOf(ep EndpointID) IsolationShape {
+	return endpointShapes[ep]
 }
 
 // IsDenied reports whether a response denied the cross-account access. Per the

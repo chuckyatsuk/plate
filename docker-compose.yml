@@ -1,0 +1,61 @@
+# Plate — the open-source quickstart (spec Q4: "the compose file IS the
+# open-source quickstart"). `docker compose up` and a stranger has a working
+# read-path Plate: the API, its own Postgres, and imgproxy for image transforms.
+#
+# Production points DATABASE_URL at Supabase and runs the worker on Cloud Run
+# (spec Q4), but the SHIPPED compose file always includes a Postgres container so
+# this works with nothing external — Supabase is our production choice, never a
+# requirement baked into the project (spec Q4, managed Postgres note).
+#
+# The API runs the SAME migrations at boot that the test container runs, so the
+# schema here is the one the isolation conformance test proved against — no drift.
+services:
+  plate-api:
+    build: .
+    command: ["serve"]
+    ports:
+      - "8080:8080"
+    environment:
+      PLATE_ENV: development
+      PLATE_LOG_LEVEL: info
+      PLATE_HTTP_ADDR: ":8080"
+      DATABASE_URL: "postgres://plate:plate@postgres:5432/plate?sslmode=disable"
+      # Image transforms via imgproxy (ONLY_PRESETS enforced in imgproxy).
+      IMGPROXY_BASE_URL: "http://imgproxy:8080"
+      # Pass-through bytes (AV, documents, originals) serve from R2 in production;
+      # for a local-only quickstart these can point at any S3-compatible base.
+      R2_PUBLIC_BASE: "http://localhost:9000"
+      # Token validation: supply a base64 raw Ed25519 public key. Empty here so a
+      # stranger can boot and read the health endpoints; set it to accept tokens.
+      PLATE_JWT_PUBLIC_KEY: "${PLATE_JWT_PUBLIC_KEY:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: plate
+      POSTGRES_PASSWORD: plate
+      POSTGRES_DB: plate
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plate -d plate"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - plate-pgdata:/var/lib/postgresql/data
+
+  imgproxy:
+    image: darthsim/imgproxy:latest
+    environment:
+      # Refuse ad-hoc params — intent presets only (spec §2). Presets are supplied
+      # by the deployment; this is the lockdown that makes intent structural.
+      IMGPROXY_ONLY_PRESETS: "true"
+    ports:
+      - "8081:8080"
+
+volumes:
+  plate-pgdata:

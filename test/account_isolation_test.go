@@ -21,6 +21,7 @@ package plate_test
 // it fails toward "not yet proven," never toward a false green.
 
 import (
+	"strings"
 	"testing"
 
 	plate "github.com/chuckyatsuk/plate/internal/plate"
@@ -38,6 +39,11 @@ const (
 	bJobID       = "01BBBBBBBBBBBBBBBBBBBBJOB0"
 	bGrantID     = "01BBBBBBBBBBBBBBBBBBBGRANT"
 	bKeySentinel = "acct-b/01BBBBBBBBBBBBBBBBBBBBBBBB" // B's {account}/{asset-id} storage key
+
+	// A's own asset. The enumeration assertion (listAssets) checks BOTH
+	// directions: B's data ABSENT and A's own asset PRESENT — so an implementation
+	// that returns an empty list for everyone cannot pass for the wrong reason.
+	aAssetID = "01AAAAAAAAAAAAAAAAAAAAAAAA"
 )
 
 // callerA is maximally privileged: it holds EVERY scope. A denial that survives
@@ -76,14 +82,40 @@ func TestAccountIsolation_EveryEndpoint_DeniesCrossAccount(t *testing.T) {
 		t.Run(string(ep), func(t *testing.T) {
 			resp := svc.CallCrossAccount(ep, callerA(), targetFor(ep))
 
-			if !support.IsDenied(resp.Status) {
-				t.Fatalf("%s: account A reached a B-owned resource — HTTP %d, expected a denial (403/404). This is the worst bug this architecture can have: a code-enforced boundary that was not enforced on THIS endpoint (spec Q4).", ep, resp.Status)
-			}
-			if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID) {
-				t.Fatalf("%s: response to account A contained account B's data (status %d) — even a leak-safe 404 must not echo B's account, key, or ids. Body: %q", ep, resp.Status, string(resp.Body))
+			switch support.ShapeOf(ep) {
+			case support.ShapeScopedEnumeration:
+				// An enumeration endpoint (listAssets) has no cross-account target:
+				// correct isolation is a 200 whose result set contains ONLY the
+				// caller's own data. A denial here would be a FAILURE, not a pass.
+				if resp.Status < 200 || resp.Status >= 300 {
+					t.Fatalf("%s: enumeration of the caller's OWN resources should succeed (2xx); got HTTP %d. Listing your own assets is not a cross-account access and must not be denied.", ep, resp.Status)
+				}
+				// The leak that actually happens on a list endpoint: a query that
+				// forgot `WHERE account = $claim` and returned B's rows too.
+				if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID) {
+					t.Fatalf("%s: account A's listing contained account B's data (status %d) — the result set was not scoped to the caller (a missing `WHERE account = $claim`). Body: %q", ep, resp.Status, string(resp.Body))
+				}
+				// And it must actually contain A's own asset — otherwise "no B data"
+				// is a vacuous pass on an empty list for everyone.
+				if !containsStr(resp.Body, aAssetID) {
+					t.Fatalf("%s: account A's listing did not contain A's own asset %q (status %d) — assert BOTH directions so an empty-list-for-everyone implementation cannot pass. Body: %q", ep, aAssetID, resp.Status, string(resp.Body))
+				}
+
+			default: // ShapeDenyTarget
+				if !support.IsDenied(resp.Status) {
+					t.Fatalf("%s: account A reached a B-owned resource — HTTP %d, expected a denial (403/404). This is the worst bug this architecture can have: a code-enforced boundary that was not enforced on THIS endpoint (spec Q4).", ep, resp.Status)
+				}
+				if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID) {
+					t.Fatalf("%s: response to account A contained account B's data (status %d) — even a leak-safe 404 must not echo B's account, key, or ids. Body: %q", ep, resp.Status, string(resp.Body))
+				}
 			}
 		})
 	}
+}
+
+// containsStr is a tiny helper for the enumeration "A present" assertion.
+func containsStr(body []byte, s string) bool {
+	return strings.Contains(string(body), s)
 }
 
 // createUpload has no target resource — it creates under the CALLER's account —
