@@ -1,0 +1,25 @@
+# gitleaks config for Plate.
+#
+# Extend the default ruleset — we want every real detector — and add a narrow
+# allowlist for FALSE POSITIVES only. Nothing here is a secret: the entries are
+# example identifiers (ULID-shaped asset/storage keys) used in tests and the
+# contract's own examples. Their length and entropy trip the generic-api-key
+# rule, but they authenticate nothing.
+#
+# Keep this list tight. A real key must never be added here to silence the scan —
+# the whole point of secret-scan on a public repo is that a real leak fails CI.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Example ULID-shaped identifiers in tests and contract examples — not secrets."
+regexTarget = "match"
+regexes = [
+  # ULIDs: 26 chars, Crockford base32. Used as example asset ids / storage keys.
+  '''[0-9A-HJKMNP-TV-Z]{26}''',
+]
+paths = [
+  '''test/.*_test\.go''',
+  '''test/support/.*\.go''',
+  '''contract/openapi\.yaml''',
+]

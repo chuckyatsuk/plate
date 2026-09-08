@@ -55,7 +55,9 @@ func TestVaultObject_HasNoDeliveryURLField(t *testing.T) {
 // stub encodes this rule; the assertion checks the RESOLVED url, not that a
 // guard function ran.
 func TestResolveByIntent_OnlyOriginalReachesRawBytes(t *testing.T) {
-	vaultKey := "uri/01J9Z0K3Q4XR7NB8YF2WV6TCEH" // the {account}/{asset-id} storage key
+	// An example {account}/{asset-id} storage key. The id is ULID-shaped but is a
+	// fixture, not a credential — it authenticates nothing (see .gitleaks.toml).
+	vaultKey := "acct-example/01EXAMPLE000ASSET000ID0000"
 	r := support.NewIntentResolver(vaultKey)
 
 	nonOriginal := []plate.Intent{
