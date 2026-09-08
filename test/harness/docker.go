@@ -42,6 +42,13 @@ func dockerAvailable() bool {
 	return dockerOK
 }
 
+// DockerReachable reports whether a Docker daemon is available. It is the
+// no-*testing.T probe used from TestMain (which stands up the ephemeral Postgres
+// for the isolation conformance test) — when it is false the service is left
+// unregistered and the conformance test skips-pending, the same visible behavior
+// as the imgproxy artifact tests.
+func DockerReachable() bool { return dockerAvailable() }
+
 // RequireDocker skips the test unless a Docker daemon is reachable. The skip
 // message is explicit so a green run that quietly skipped the imgproxy/Postgres
 // artifact tests is visible, not silent.
