@@ -1,0 +1,1118 @@
+openapi: 3.1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plate — a media service with a structural vault/delivery boundary.
+#
+# This file is the CONTRACT. Both sides are generated from it (oapi-codegen for
+# the Go service, openapi-typescript for the Files caller) so drift becomes a
+# compile error rather than a 200 that is wrong — the documented recurring bug
+# class this project is escaping (spec §6).
+#
+# Design rules held throughout (spec §10 Q1):
+#   - closed enums for `intent` and refusal `reason`
+#   - required fields marked required
+#   - no bare `object`; every object schema sets additionalProperties: false
+#
+# Domain-free by construction (spec §1): nothing here names a work, exhibition,
+# artist, gallery, or external player. Plate stores files and serves renditions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+info:
+  title: Plate
+  version: 1.0.0
+  summary: Stores originals that can never be served, serves renditions that can never be oversized.
+  description: |
+    Plate holds files and serves renditions with a hard structural wall between
+    the two tiers.
+
+    **The invariant that makes this work:** a vault object and a rendition are
+    different types with different fields. A vault object has *no delivery URL
+    field at all* — asking Plate for one is a type error, not a policy violation
+    (spec §3.1). The only route to raw bytes is `intent=original`, which must be
+    named and returns a short-lived authenticated download URL.
+
+    **Account isolation is structural.** The account is a claim inside the bearer
+    token, never a request parameter. Plate checks `token.account == asset.account`
+    at every endpoint; a caller cannot assert its own identity (spec §3.2, Q3.A).
+
+    Plate delegates image transforms to imgproxy and A/V to ffmpeg; it owns only
+    the vault/delivery boundary, intent resolution, the decoded-memory clamp, and
+    the A/V tier state machine (spec §2).
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: Plate
+    url: https://github.com/chuckyatsuk/plate
+
+servers:
+  - url: https://plate.example/v1
+    description: Production (placeholder — configured per deployment)
+  - url: http://localhost:8080/v1
+    description: Local (docker compose)
+
+# All endpoints require a scoped service JWT. The account travels as the `account`
+# claim inside this token — never as a parameter (spec Q3.A).
+security:
+  - serviceToken: []
+
+tags:
+  - name: delivery
+    description: Purpose in, URL out. The highest-traffic, cheapest path.
+  - name: assets
+    description: Read asset and rendition metadata. Vault objects carry no delivery URL.
+  - name: ingest
+    description: Broker uploads (presigned PUT) and register the vault object.
+  - name: renditions
+    description: Request derivative generation; observe job state.
+  - name: grants
+    description: First-class access records for share links, packages, consignments.
+  - name: system
+    description: Health and readiness.
+
+paths:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Delivery — the reason to build Plate (spec §4)
+  # ───────────────────────────────────────────────────────────────────────────
+  /assets/{assetId}/url:
+    get:
+      tags: [delivery]
+      operationId: resolveDeliveryUrl
+      summary: Resolve a delivery URL by intent.
+      description: |
+        Callers name a **purpose** (`intent`). They cannot pass width, quality,
+        format, or crop — the CDN-allowlist trap becomes impossible because
+        routing lives here, in one service that knows every type (spec §4.1).
+
+        Two independent clamps apply to image intents: the megapixel wall (guards
+        the CDN) and the decoded-memory budget (guards the tab). The `device`
+        class supplies the input for the second; Plate does the math (spec §4.2).
+
+        When no rendition can exist, the response is `200` with `delivery: null`
+        and a closed-enum `reason` Files can act on (spec §4.3) — an honest
+        refusal is a normal outcome, not an error.
+      parameters:
+        - $ref: '#/components/parameters/AssetIdPath'
+        - name: intent
+          in: query
+          required: true
+          description: The purpose the URL is for. Closed enum.
+          schema:
+            $ref: '#/components/schemas/Intent'
+        - name: device
+          in: query
+          required: false
+          description: |
+            Device class, supplying the input to the decoded-memory clamp for
+            image intents. **Defaults to `mobile`** when unspecified — fail toward
+            the safe budget. A small viewport ALONE is sufficient to take the
+            mobile budget; never gate on `navigator.deviceMemory` (absent on
+            Safari, the browser that actually dies) (spec §4.2).
+          schema:
+            $ref: '#/components/schemas/DeviceClass'
+        - name: grant
+          in: query
+          required: false
+          description: |
+            Opaque grant id, required only when the asset's delivery mode is
+            `granted`. Presenting it triggers a per-request DB lookup; absence or
+            invalidity on a granted asset yields `delivery: null`,
+            `reason: unauthorized` rather than a 200 URL (spec Q3.B).
+          schema:
+            $ref: '#/components/schemas/GrantId'
+      responses:
+        '200':
+          description: |
+            A resolution. Either a delivery URL, or an honest refusal
+            (`delivery: null` with a `reason`). Both are 200 — a refusal is a
+            normal, actionable outcome.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryResolution'
+              examples:
+                lightboxResolved:
+                  summary: A clamped lightbox rendition
+                  value:
+                    intent: lightbox
+                    delivery:
+                      url: https://cdn.example/uri/01J.../lightbox_2048.jpg
+                      mode: public
+                      width: 2048
+                      height: 1365
+                      expires: null
+                durationRefusal:
+                  summary: A 19-minute video refuses `detail`
+                  value:
+                    intent: detail
+                    delivery: null
+                    reason: exceeded_duration_ceiling
+                    detail:
+                      duration_s: 1140
+                      ceiling_s: 720
+                pending:
+                  summary: An A/V rendition is still transcoding
+                  value:
+                    intent: detail
+                    delivery: null
+                    reason: pending
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Assets & renditions (read) — spec §3, §9
+  # ───────────────────────────────────────────────────────────────────────────
+  /assets/{assetId}:
+    get:
+      tags: [assets]
+      operationId: getAsset
+      summary: Get an asset with its vault metadata and rendition set.
+      description: |
+        Returns probed vault metadata (dimensions, duration, codec, container)
+        and the set of renditions with their status. The vault object has no
+        delivery URL field — structurally, not by omission (spec §3.1).
+      parameters:
+        - $ref: '#/components/parameters/AssetIdPath'
+      responses:
+        '200':
+          description: The asset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Asset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [assets]
+      operationId: deleteAsset
+      summary: Mark an asset for deletion (async, two-step).
+      description: |
+        Deletion is async two-step: this marks intent, and a reconciliation sweep
+        removes bytes — no distributed transaction (spec Q2, accepted costs).
+        Returns `202` with the marked asset; existence in R2 is reconciled later.
+      parameters:
+        - $ref: '#/components/parameters/AssetIdPath'
+      responses:
+        '202':
+          description: Deletion accepted; reconciliation is asynchronous.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Asset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /assets:
+    get:
+      tags: [assets]
+      operationId: listAssets
+      summary: List the calling account's assets.
+      description: |
+        Scoped to the token's account claim — there is no account parameter.
+        Cursor-paginated.
+      parameters:
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: A page of assets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /assets/{assetId}/renditions:
+    post:
+      tags: [renditions]
+      operationId: requestRendition
+      summary: Request generation of a rendition for an intent.
+      description: |
+        Idempotent per (asset, intent): re-requesting an existing rendition
+        returns it rather than duplicating work. Image intents resolve
+        synchronously or fast-queued; A/V intents enqueue a job and return `202`
+        with job state. Because the vault write already succeeded, a failed job
+        is recoverable, never data loss (spec §5.2).
+      parameters:
+        - $ref: '#/components/parameters/AssetIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenditionRequest'
+      responses:
+        '200':
+          description: Rendition already exists (or generated synchronously).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rendition'
+        '202':
+          description: A/V rendition enqueued; poll the job for progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The intent cannot ever be satisfied for this asset (e.g. a ceiling
+            breach fixed at ingest). The body carries the same closed-enum reason
+            as a delivery refusal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RenditionRefusal'
+
+  /jobs/{jobId}:
+    get:
+      tags: [renditions]
+      operationId: getJob
+      summary: Get transcode/derivation job state.
+      description: Real job state — queued/running/succeeded/failed — with retry count and progress.
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/JobId'
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Ingest — broker uploads, own derivatives (spec §5.1)
+  # ───────────────────────────────────────────────────────────────────────────
+  /uploads:
+    post:
+      tags: [ingest]
+      operationId: createUpload
+      summary: Broker a direct upload — get a narrowly-scoped presigned PUT.
+      description: |
+        Plate never streams the bytes: the browser PUTs direct to R2 (spec §5.1),
+        preserving the no-4.5MB-limit property. The presigned PUT is bounded on
+        exact key, content-type, and content-length range (spec Q3.C). Plate owns
+        key generation outright — the caller does not choose the key (spec §3.3).
+
+        The caller finalizes with `POST /uploads/{uploadId}/finalize` after the
+        PUT succeeds; an unfinalized upload is reclaimed by a reconciliation sweep
+        (spec §5.1, accepted cost).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadRequest'
+      responses:
+        '201':
+          description: A presigned PUT the browser can use for exactly one object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadTicket'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /uploads/{uploadId}/finalize:
+    post:
+      tags: [ingest]
+      operationId: finalizeUpload
+      summary: Register the vault object after a successful PUT.
+      description: |
+        Synchronous: Plate checksums and probes the object (ffprobe/libvips),
+        records true dimensions/duration/codec/container, and creates the asset
+        with its single immutable vault object. It **refuses to promote** anything
+        that breaches a ceiling — fail closed (spec §5.3). The vault object is
+        created regardless; refusal is about *delivery*, not *storage*.
+      parameters:
+        - name: uploadId
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UploadId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinalizeRequest'
+      responses:
+        '201':
+          description: Asset created with its vault object and probed metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Asset'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The uploaded object failed verification (checksum mismatch, corrupt, unprobeable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Grants — first-class access records (spec Q3, "grants are first-class objects")
+  # ───────────────────────────────────────────────────────────────────────────
+  /grants:
+    post:
+      tags: [grants]
+      operationId: createGrant
+      summary: Create a grant over a SET of assets.
+      description: |
+        One grant per SET (package/share link) — never per file (spec Q3). The
+        set is frozen at issue time; adding an asset later is a new grant. Plate
+        holds the grant; the caller owns *why* it exists.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantRequest'
+      responses:
+        '201':
+          description: The grant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Grant'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /grants/{grantId}:
+    get:
+      tags: [grants]
+      operationId: getGrant
+      summary: Get a grant, including its access log.
+      description: |
+        The access log answers the question dealers ask constantly — "opened 14
+        times, last Tuesday" (spec Q3).
+      parameters:
+        - $ref: '#/components/parameters/GrantIdPath'
+      responses:
+        '200':
+          description: The grant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Grant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [grants]
+      operationId: revokeGrant
+      summary: Revoke a grant.
+      description: |
+        One row, one revocation — every asset in the set stops resolving.
+        Revocation is effective within one short expiry window, not instantly,
+        because delivery returns URLs and Plate is not in the byte path for
+        already-issued ones (spec Q5, the honest gap).
+      parameters:
+        - $ref: '#/components/parameters/GrantIdPath'
+      responses:
+        '200':
+          description: The revoked grant (revoked_at set).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Grant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # System — twelve-factor / K8s-ready (spec Q4)
+  # ───────────────────────────────────────────────────────────────────────────
+  /healthz:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Liveness probe.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /readyz:
+    get:
+      tags: [system]
+      operationId: ready
+      summary: Readiness probe (DB and storage reachable).
+      security: []
+      responses:
+        '200':
+          description: Ready to serve.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: Not ready (a dependency is unreachable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+# ─────────────────────────────────────────────────────────────────────────────
+components:
+
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Scoped service JWT (spec Q3.A). Standard claims: `iss`, `sub`, `aud`,
+        `exp`, plus `account` and `scope`. **The `account` claim is the only
+        source of the caller's account** — never a request parameter. Scopes are
+        first-class: `assets:read`, `assets:write`, `renditions:generate`,
+        `grants:manage`. Issuance is separable from validation (OAuth-shaped,
+        not OAuth-implemented).
+
+  parameters:
+    AssetIdPath:
+      name: assetId
+      in: path
+      required: true
+      description: Service-generated asset id (ULID or content hash). Filename is metadata, not identity.
+      schema:
+        $ref: '#/components/schemas/AssetId'
+    GrantIdPath:
+      name: grantId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/GrantId'
+    CursorQuery:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor from a previous page's `next_cursor`.
+      schema:
+        type: string
+        maxLength: 512
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 200
+        default: 50
+
+  responses:
+    BadRequest:
+      description: The request was malformed (unknown intent, bad parameter).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing, expired, or invalid service token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: |
+        The token is valid but its account claim does not match the target
+        resource, or it lacks the required scope. This is the structural
+        account-isolation boundary (spec Q3.A).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: No such resource for this account.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+
+    # ── Identifiers ──────────────────────────────────────────────────────────
+    AssetId:
+      type: string
+      description: Service-generated. ULID or content hash.
+      pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
+      examples: ['01J9Z0K3Q4XR7NB8YF2WV6TCEH']
+    GrantId:
+      type: string
+      pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
+    JobId:
+      type: string
+      pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
+    UploadId:
+      type: string
+      pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
+    AccountId:
+      type: string
+      description: |
+        Opaque foreign reference (spec Q2). Plate stores an id plus storage
+        config — NO users, roles, or permissions. Identity is a separate concern.
+      pattern: '^[0-9A-Za-z][0-9A-Za-z_.-]{1,127}$'
+
+    # ── Closed enums (the strictness that matters) ───────────────────────────
+    Intent:
+      type: string
+      description: |
+        The purpose a URL is for. Closed enum — a caller cannot invent one, and a
+        new media type cannot silently opt into a metered path (spec §4.1).
+      enum:
+        - thumbnail   # image — small, admin/grid cells
+        - grid        # image — gallery tile
+        - lightbox    # image — clamped by BOTH megapixel wall and decoded budget
+        - poster      # video/audio — the still
+        - loop        # video — <=30s, silent, ~640px — the grid tile
+        - detail      # video/audio — <=12min, with audio, <=1080p — the lightbox
+        - original    # any — the ONLY route to raw bytes, and it must be named
+
+    ReasonCode:
+      type: string
+      description: |
+        Why no delivery rendition exists. Closed enum (spec §4.3). `unauthorized`
+        covers a missing/invalid/expired grant on a `granted` asset.
+      enum:
+        - exceeded_duration_ceiling
+        - exceeded_size_ceiling
+        - unsupported_format
+        - unauthorized
+        - pending
+        - failed
+
+    DeviceClass:
+      type: string
+      description: Supplies the decoded-memory clamp input. Defaults to `mobile` (safe budget).
+      enum: [mobile, desktop]
+      default: mobile
+
+    DeliveryMode:
+      type: string
+      description: |
+        How a delivery URL is protected, chosen per asset (spec Q3.B). `public`
+        and `signed` keep Plate out of the byte path; `granted` puts a per-request
+        DB lookup in the hot path and is the only mode where revocation is the
+        product.
+      enum: [public, signed, granted]
+
+    MediaKind:
+      type: string
+      description: The broad class of the stored file. Drives which intents are valid and the delivery route.
+      enum: [image, video, audio, document]
+
+    RenditionStatus:
+      type: string
+      enum: [ready, pending, failed]
+
+    JobStatus:
+      type: string
+      enum: [queued, running, succeeded, failed]
+
+    Scope:
+      type: string
+      enum: [assets:read, assets:write, renditions:generate, grants:manage]
+
+    # ── Delivery ─────────────────────────────────────────────────────────────
+    DeliveryResolution:
+      type: object
+      additionalProperties: false
+      description: |
+        The result of resolving an intent. Exactly one of `delivery` or `reason`
+        is meaningful: a non-null `delivery` is a URL; a null `delivery` carries a
+        `reason` and optional `detail`.
+      required: [intent, delivery]
+      properties:
+        intent:
+          $ref: '#/components/schemas/Intent'
+        delivery:
+          description: The delivery URL and its bounds, or null when refused.
+          oneOf:
+            - $ref: '#/components/schemas/Delivery'
+            - type: 'null'
+        reason:
+          $ref: '#/components/schemas/ReasonCode'
+        detail:
+          $ref: '#/components/schemas/RefusalDetail'
+
+    Delivery:
+      type: object
+      additionalProperties: false
+      description: A resolved, browser-reachable delivery URL and the bounds it was clamped to.
+      required: [url, mode]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: |
+            The browser-reachable URL. For `original` this is a short-lived
+            authenticated download URL — never a CDN URL, never embeddable.
+        mode:
+          $ref: '#/components/schemas/DeliveryMode'
+        width:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Output width in pixels (image/video renditions).
+        height:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Output height in pixels (image/video renditions).
+        expires:
+          description: RFC 3339 expiry for signed/granted/original URLs; null for stable public URLs.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+
+    RefusalDetail:
+      type: object
+      additionalProperties: false
+      description: |
+        Machine-readable context for a refusal. Fields are optional because they
+        depend on the reason (a duration ceiling carries seconds; an unsupported
+        format carries the container).
+      properties:
+        duration_s:
+          type: number
+          format: double
+          minimum: 0
+        ceiling_s:
+          type: number
+          format: double
+          minimum: 0
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        ceiling_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        container:
+          type: string
+          maxLength: 64
+        codec:
+          type: string
+          maxLength: 64
+
+    # ── Asset & vault ────────────────────────────────────────────────────────
+    Asset:
+      type: object
+      additionalProperties: false
+      description: |
+        One uploaded file: exactly one immutable vault object, plus zero or more
+        renditions. Account-scoped. Note the vault object has NO delivery URL
+        field — structurally, not by omission (spec §3.1).
+      required: [id, account, kind, vault, renditions, created]
+      properties:
+        id:
+          $ref: '#/components/schemas/AssetId'
+        account:
+          $ref: '#/components/schemas/AccountId'
+        kind:
+          $ref: '#/components/schemas/MediaKind'
+        filename:
+          type: string
+          description: Human-readable original filename. Metadata, not identity.
+          maxLength: 1024
+        vault:
+          $ref: '#/components/schemas/VaultObject'
+        renditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rendition'
+        created:
+          type: string
+          format: date-time
+        deleted_at:
+          description: Set when deletion has been requested; bytes reconciled asynchronously.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+
+    VaultObject:
+      type: object
+      additionalProperties: false
+      description: |
+        The immutable original. Probed metadata only — deliberately NO url field.
+        The single most important schema in this contract: the absence is the
+        design. Asking for a delivery URL here is a type error (spec §3.1).
+      required: [key, checksum, size_bytes]
+      properties:
+        key:
+          type: string
+          description: Storage key, `{account}/{asset-id}`. Server-to-server use only; never handed to a browser.
+          maxLength: 1024
+        checksum:
+          type: string
+          description: Content checksum recorded at ingest (e.g. sha256:...).
+          maxLength: 128
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        width:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Probed pixel width (image/video).
+        height:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Probed pixel height (image/video).
+        duration_s:
+          type: number
+          format: double
+          minimum: 0
+          description: Probed duration in seconds (audio/video).
+        codec:
+          type: string
+          maxLength: 64
+        container:
+          type: string
+          maxLength: 64
+
+    Rendition:
+      type: object
+      additionalProperties: false
+      description: A bounded, browser-reachable derivative for one intent. The only tier a browser can reach.
+      required: [intent, status]
+      properties:
+        intent:
+          $ref: '#/components/schemas/Intent'
+        status:
+          $ref: '#/components/schemas/RenditionStatus'
+        width:
+          type: integer
+          format: int32
+          minimum: 1
+        height:
+          type: integer
+          format: int32
+          minimum: 1
+        duration_s:
+          type: number
+          format: double
+          minimum: 0
+        has_audio:
+          type: boolean
+          description: True only for `detail`; `loop` is always silent (spec §5.4).
+        reason:
+          $ref: '#/components/schemas/ReasonCode'
+          # present only when status = failed
+
+    AssetPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Asset'
+        next_cursor:
+          description: Opaque cursor for the next page, or null when exhausted.
+          oneOf:
+            - type: string
+              maxLength: 512
+            - type: 'null'
+
+    # ── Rendition requests ───────────────────────────────────────────────────
+    RenditionRequest:
+      type: object
+      additionalProperties: false
+      required: [intent]
+      properties:
+        intent:
+          $ref: '#/components/schemas/Intent'
+        device:
+          $ref: '#/components/schemas/DeviceClass'
+
+    RenditionRefusal:
+      type: object
+      additionalProperties: false
+      description: The intent can never be satisfied for this asset.
+      required: [intent, reason]
+      properties:
+        intent:
+          $ref: '#/components/schemas/Intent'
+        reason:
+          $ref: '#/components/schemas/ReasonCode'
+        detail:
+          $ref: '#/components/schemas/RefusalDetail'
+
+    Job:
+      type: object
+      additionalProperties: false
+      description: Durable state for a queued derivation (A/V transcode). Survives worker restart (spec §5.2).
+      required: [id, asset, intent, status, retries]
+      properties:
+        id:
+          $ref: '#/components/schemas/JobId'
+        asset:
+          $ref: '#/components/schemas/AssetId'
+        intent:
+          $ref: '#/components/schemas/Intent'
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        progress:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Fractional progress 0..1 while running.
+        retries:
+          type: integer
+          format: int32
+          minimum: 0
+        reason:
+          $ref: '#/components/schemas/ReasonCode'
+          # present only when status = failed
+        created:
+          type: string
+          format: date-time
+        updated:
+          type: string
+          format: date-time
+
+    # ── Ingest ───────────────────────────────────────────────────────────────
+    UploadRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Ask for a presigned PUT. The caller declares content-type and size so the
+        PUT can be bound to them; the caller does NOT choose the key — Plate owns
+        key generation (spec §3.3).
+      required: [content_type, size_bytes]
+      properties:
+        content_type:
+          type: string
+          description: MIME type of the object to be uploaded. Bound into the presigned PUT.
+          maxLength: 255
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Exact or upper-bound byte size. Bound into the presigned PUT's content-length range.
+        filename:
+          type: string
+          description: Optional human-readable name, recorded as metadata.
+          maxLength: 1024
+
+    UploadTicket:
+      type: object
+      additionalProperties: false
+      description: A presigned PUT the browser can use for exactly one object, plus the id to finalize with.
+      required: [upload_id, url, method, headers, expires]
+      properties:
+        upload_id:
+          $ref: '#/components/schemas/UploadId'
+        url:
+          type: string
+          format: uri
+          description: The presigned PUT URL. Writes exactly one object; bounded on key, type, and size.
+        method:
+          type: string
+          enum: [PUT]
+        headers:
+          type: array
+          description: Headers the browser must send verbatim with the PUT (e.g. Content-Type).
+          items:
+            $ref: '#/components/schemas/Header'
+        expires:
+          type: string
+          format: date-time
+          description: PUT expiry — generous for a studio's slow connection (spec Q3.C).
+
+    Header:
+      type: object
+      additionalProperties: false
+      required: [name, value]
+      properties:
+        name:
+          type: string
+          maxLength: 128
+        value:
+          type: string
+          maxLength: 2048
+
+    FinalizeRequest:
+      type: object
+      additionalProperties: false
+      description: Signal a successful PUT so Plate can checksum, probe, and register the vault object.
+      required: [checksum]
+      properties:
+        checksum:
+          type: string
+          description: Client-computed checksum to verify against the stored object (e.g. sha256:...).
+          maxLength: 128
+
+    # ── Grants ───────────────────────────────────────────────────────────────
+    GrantRequest:
+      type: object
+      additionalProperties: false
+      description: Create a grant over a frozen SET of assets (spec Q3).
+      required: [assets, expires]
+      properties:
+        assets:
+          type: array
+          description: The SET this grant covers, frozen at issue time. One grant per set, never per file.
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/AssetId'
+        recipient:
+          type: string
+          description: Optional opaque recipient label. Plate does not model who this is.
+          maxLength: 255
+        expires:
+          type: string
+          format: date-time
+          description: When access ends. Short by default (minutes) so revocation is effective within one window.
+
+    Grant:
+      type: object
+      additionalProperties: false
+      description: |
+        A first-class access record — "this link can see these files, until this
+        date." Plate holds it; the caller owns why it exists (spec Q3).
+      required: [id, account, assets, created, expires]
+      properties:
+        id:
+          $ref: '#/components/schemas/GrantId'
+        account:
+          $ref: '#/components/schemas/AccountId'
+        assets:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/AssetId'
+        recipient:
+          description: Optional opaque recipient label, or null.
+          oneOf:
+            - type: string
+              maxLength: 255
+            - type: 'null'
+        created:
+          type: string
+          format: date-time
+        expires:
+          type: string
+          format: date-time
+        revoked_at:
+          description: When the grant was revoked, or null if active.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        access_log:
+          type: array
+          description: Observability — "opened 14 times, last Tuesday" (spec Q3).
+          items:
+            $ref: '#/components/schemas/AccessLogEntry'
+
+    AccessLogEntry:
+      type: object
+      additionalProperties: false
+      required: [at]
+      properties:
+        at:
+          type: string
+          format: date-time
+        asset:
+          $ref: '#/components/schemas/AssetId'
+        intent:
+          $ref: '#/components/schemas/Intent'
+
+    # ── System & errors ──────────────────────────────────────────────────────
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        version:
+          type: string
+          maxLength: 64
+
+    Error:
+      type: object
+      additionalProperties: false
+      description: A structured error. `code` is a stable string a caller can branch on.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          maxLength: 64
+        message:
+          type: string
+          description: Human-readable explanation. Never leaks another account's data.
+          maxLength: 1024

@@ -1,0 +1,26 @@
+# Redocly lint config for the Plate contract.
+#
+# The contract lints clean against the recommended ruleset except for four
+# warnings that are DELIBERATE for this project. They are turned off here
+# explicitly — with the reason — rather than left as recurring noise, so a real
+# new warning stands out in CI.
+extends:
+  - recommended
+
+rules:
+  # The compose quickstart IS localhost — the second server entry is meant to be
+  # http://localhost:8080/v1 so a stranger's `docker compose up` matches the docs.
+  no-server-example.com: off
+  no-server-trailing-slash: warn
+
+  # /healthz and /readyz are liveness/readiness probes. A 4xx is not meaningful
+  # for liveness; /readyz already models unreadiness as 503. Requiring a 4xx here
+  # would be cargo-culting the rule.
+  operation-4xx-response: off
+
+  # `Scope` is a first-class enum (assets:read, assets:write, renditions:generate,
+  # grants:manage) that lives in the JWT, not in any request/response body — so it
+  # is referenced from the securityScheme description, not via $ref. Keeping it as
+  # a named schema means generated clients get the type; it is intentionally not
+  # wired into a path.
+  no-unused-components: off
