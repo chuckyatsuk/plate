@@ -1,0 +1,62 @@
+# CI — the incidents-as-tests suite (spec §7).
+#
+# The whole point of this suite is that it runs with `go test`, in CI, with NO
+# live database and NO external services (spec §7): the root-cause fix for
+# "every behavioural check needs the live shared DB." Everything it needs is
+# either a static binary (ffmpeg/ffprobe) or an ephemeral container the test
+# starts and tears down itself (imgproxy via testcontainers). No Atlas, no
+# secrets, no network to any real backend.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test (artifact suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      # ffmpeg/ffprobe are the A/V engines the faststart and duration-ceiling
+      # tests wrap. They are static binaries, installed here so those artifact
+      # tests actually RUN in CI (they self-skip only when absent). Docker is
+      # already present on GitHub-hosted runners, so testcontainers (imgproxy)
+      # needs no setup step.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      # Verify the contract still generates the types the tests target — a
+      # contract change that breaks generation is a red build, not a surprise at
+      # service-build time (spec §6).
+      - name: Regenerate contract types and check they are current
+        run: |
+          go generate ./...
+          if ! git diff --quiet -- internal/plate/plate.gen.go; then
+            echo "::error::internal/plate/plate.gen.go is stale — run 'go generate ./...' and commit the result"
+            git diff -- internal/plate/plate.gen.go
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # -count=1 disables the test cache so the container-backed tests really run.
+      - name: Test
+        run: go test -count=1 -timeout 15m ./...
