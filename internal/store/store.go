@@ -113,11 +113,20 @@ type Upload struct {
 // container from the probe.
 type VaultRecord struct {
 	Kind      plate.MediaKind
-	Checksum  string
+	Checksum  string // the verified checksum, or "" if not yet verified (never the raw client claim)
 	SizeBytes int64
 	Width     *int32
 	Height    *int32
 	DurationS *float64
 	Codec     *string
 	Container *string
+
+	// ProbeStatus is "ready" (probed — images at finalize, documents trivially),
+	// "pending" (A/V, probed later by the worker), or "failed". Empty defaults to
+	// "ready" (review ruling 1).
+	ProbeStatus string
+	// ChecksumVerified is true only when the stored object's checksum was actually
+	// confirmed (server-side at PUT, ETag compare, or worker hash) — never from an
+	// unverified client claim (review ruling 2).
+	ChecksumVerified bool
 }

@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -79,8 +80,23 @@ func (p *Prober) ProbeImage(path string) (Result, error) {
 		return Result{}, fmt.Errorf("probe: open image: %w", err)
 	}
 	defer f.Close()
+	return p.ProbeImageReader(f)
+}
 
-	cfg, format, err := image.DecodeConfig(f)
+// ProbeImageReader reads image dimensions from an io.Reader — used by the API's
+// finalize with a RANGED GET of just the header bytes (review ruling 1), so a
+// 300MB TIFF is never fully downloaded into the request. image.DecodeConfig reads
+// only as far as the header for the formats we register, so a ~64KB prefix is
+// enough for the overwhelmingly common case; a format that needs more of the file
+// than the prefix provides fails closed (unprobeable), which is correct.
+//
+// ⚠️ LIMIT 1 — EXIF orientation: DecodeConfig does not read it; a rotated JPEG
+// reports STORED (transposed) dimensions. Harmless for the megapixel/decoded-
+// memory math (w*h is identical); revisit with libvips if DISPLAY dims are ever
+// needed. ⚠️ LIMIT 2 — a header-only prefix: enough for JPEG/PNG/GIF headers;
+// exotic formats that back-load their dimensions would need a larger prefix.
+func (p *Prober) ProbeImageReader(r io.Reader) (Result, error) {
+	cfg, format, err := image.DecodeConfig(r)
 	if err != nil {
 		// Fail closed: an image we cannot read does not get promoted (spec §5.3).
 		return Result{}, fmt.Errorf("probe: decode image config: %w", err)

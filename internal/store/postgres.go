@@ -277,14 +277,20 @@ func (p *Postgres) FinalizeUpload(ctx context.Context, account, uploadID string,
 	// Create the asset + vault object (the upload id becomes the asset id — Plate
 	// owns key generation, §3.3). The vault object is ALWAYS created; a ceiling
 	// breach is a DELIVERY refusal, not a storage refusal (spec §5.3).
+	probeStatus := v.ProbeStatus
+	if probeStatus == "" {
+		probeStatus = "ready"
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO assets (id, account, kind, filename,
 		    vault_key, vault_checksum, vault_size_bytes,
-		    vault_width, vault_height, vault_duration_s, vault_codec, vault_container)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		    vault_width, vault_height, vault_duration_s, vault_codec, vault_container,
+		    probe_status, checksum_verified)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		uploadID, account, string(v.Kind), filename,
 		key, v.Checksum, v.SizeBytes,
-		v.Width, v.Height, v.DurationS, v.Codec, v.Container)
+		v.Width, v.Height, v.DurationS, v.Codec, v.Container,
+		probeStatus, v.ChecksumVerified)
 	if err != nil {
 		return plate.Asset{}, fmt.Errorf("store: create asset on finalize: %w", err)
 	}

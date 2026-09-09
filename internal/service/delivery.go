@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 
+	"github.com/chuckyatsuk/plate/internal/id"
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 )
 
@@ -99,18 +100,28 @@ func (b URLBuilder) Resolve(intent plate.Intent, kind plate.MediaKind, vaultKey 
 
 	// A non-original intent resolves to a bounded rendition URL on the host the
 	// allowlist chose — never the vault original.
-	var base string
 	switch host {
 	case HostImageCDN:
-		base = b.ImageCDNBase
-	case HostR2:
-		base = b.R2PublicBase
+		// Images transform on the fly: imgproxy fetches the vault original and
+		// applies the intent's preset. The URL names the PRESET (a purpose), never
+		// ad-hoc params (spec §4.1); ONLY_PRESETS enforces that at imgproxy.
+		return plate.DeliveryResolution{
+			Intent: intent,
+			Delivery: &plate.Delivery{
+				Url:  fmt.Sprintf("%s/%s/plain/%s", b.ImageCDNBase, intent, vaultKey),
+				Mode: plate.Public,
+			},
+		}, nil
+	default: // HostR2 — A/V renditions serve the worker-written object DIRECTLY.
+		// The URL MUST point at the exact key the worker wrote (id.RenditionKey),
+		// not a fabricated path — otherwise a ready rendition 404s (the deployed-
+		// smoke bug). Shared key function keeps write and read in lockstep.
+		return plate.DeliveryResolution{
+			Intent: intent,
+			Delivery: &plate.Delivery{
+				Url:  b.R2PublicBase + "/" + id.RenditionKey(vaultKey, string(intent)),
+				Mode: plate.Public,
+			},
+		}, nil
 	}
-	return plate.DeliveryResolution{
-		Intent: intent,
-		Delivery: &plate.Delivery{
-			Url:  fmt.Sprintf("%s/rendition/%s/%s", base, intent, vaultKey),
-			Mode: plate.Public,
-		},
-	}, nil
 }

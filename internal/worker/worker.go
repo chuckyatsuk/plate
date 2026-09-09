@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/chuckyatsuk/plate/internal/id"
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 	"github.com/chuckyatsuk/plate/internal/probe"
 	"github.com/chuckyatsuk/plate/internal/storage"
@@ -28,10 +29,11 @@ type Worker struct {
 	prober     *probe.Prober
 	log        *slog.Logger
 
-	scratchDir  string
-	leaseTTL    time.Duration
-	pollEvery   time.Duration
-	maxAttempts int32
+	scratchDir         string
+	leaseTTL           time.Duration
+	pollEvery          time.Duration
+	maxAttempts        int32
+	detailMaxDurationS float64
 }
 
 // Config wires the worker. Values come from the environment in production
@@ -47,20 +49,26 @@ type Config struct {
 	LeaseTTL    time.Duration // a running job with an older heartbeat is reclaimable
 	PollEvery   time.Duration // how often to poll an empty queue
 	MaxAttempts int32         // retries before a job is marked failed
+
+	// DetailMaxDurationS is the detail-tier duration ceiling in seconds (spec §5.4,
+	// PLATE_DETAIL_MAX_DURATION, default 720). A source over it is refused at
+	// delivery, not transcoded. Zero disables the check.
+	DetailMaxDurationS float64
 }
 
 // New builds a Worker with sane defaults for the zero values.
 func New(cfg Config) *Worker {
 	w := &Worker{
-		store:       cfg.Store,
-		storage:     cfg.Storage,
-		transcoder:  cfg.Transcoder,
-		prober:      cfg.Prober,
-		log:         cfg.Log,
-		scratchDir:  cfg.ScratchDir,
-		leaseTTL:    cfg.LeaseTTL,
-		pollEvery:   cfg.PollEvery,
-		maxAttempts: cfg.MaxAttempts,
+		store:              cfg.Store,
+		storage:            cfg.Storage,
+		transcoder:         cfg.Transcoder,
+		prober:             cfg.Prober,
+		log:                cfg.Log,
+		scratchDir:         cfg.ScratchDir,
+		leaseTTL:           cfg.LeaseTTL,
+		pollEvery:          cfg.PollEvery,
+		maxAttempts:        cfg.MaxAttempts,
+		detailMaxDurationS: cfg.DetailMaxDurationS,
 	}
 	if w.log == nil {
 		w.log = slog.Default()
@@ -77,7 +85,50 @@ func New(cfg Config) *Worker {
 	if w.maxAttempts <= 0 {
 		w.maxAttempts = 3
 	}
+	if w.detailMaxDurationS <= 0 {
+		w.detailMaxDurationS = 720 // spec §5.4: 12 min
+	}
 	return w
+}
+
+// vaultRecordFromProbe maps a probe.Result onto the vault fields the worker
+// backfills for a deferred-probe A/V asset.
+func vaultRecordFromProbe(pr probe.Result) store.VaultRecord {
+	vr := store.VaultRecord{}
+	if pr.Width > 0 {
+		w := int32(pr.Width)
+		vr.Width = &w
+	}
+	if pr.Height > 0 {
+		h := int32(pr.Height)
+		vr.Height = &h
+	}
+	if pr.DurationS > 0 {
+		d := pr.DurationS
+		vr.DurationS = &d
+	}
+	if pr.Codec != "" {
+		c := pr.Codec
+		vr.Codec = &c
+	}
+	if pr.Container != "" {
+		ct := pr.Container
+		vr.Container = &ct
+	}
+	return vr
+}
+
+// RunOnceForTest claims and processes exactly one job, returning store.ErrNoJob
+// when the queue is empty. It exists so an end-to-end test can drive the worker
+// deterministically (no polling goroutine); production uses Run. Named *ForTest
+// because it is only appropriate for synchronous, single-threaded test drives.
+func (w *Worker) RunOnceForTest(ctx context.Context) error {
+	claimed, err := w.store.ClaimNextJob(ctx, w.leaseTTL)
+	if err != nil {
+		return err
+	}
+	w.runOne(ctx, claimed)
+	return nil
 }
 
 // Run loops until ctx is cancelled (graceful SIGTERM shutdown, spec Q4). It
@@ -131,9 +182,9 @@ func (w *Worker) runOne(ctx context.Context, job store.ClaimedJob) {
 	log.Info("job succeeded")
 }
 
-// process does the work: pull → transcode → probe → put → complete. It is
-// idempotent — the rendition key is deterministic, so a re-run overwrites rather
-// than duplicates.
+// process does the work: pull → probe (backfill vault) → ceiling check →
+// transcode → put → complete. It is idempotent — the rendition key is
+// deterministic, so a re-run overwrites rather than duplicates.
 func (w *Worker) process(ctx context.Context, job store.ClaimedJob) error {
 	// Scratch files for this job (spec Q4: real scratch disk).
 	work, err := os.MkdirTemp(w.scratchDir, "plate-job-"+job.ID+"-*")
@@ -149,6 +200,36 @@ func (w *Worker) process(ctx context.Context, job store.ClaimedJob) error {
 	// derivative-path credentials, spec §5.1).
 	if err := w.download(ctx, job.VaultKey, srcPath); err != nil {
 		return fmt.Errorf("pull vault original: %w", err)
+	}
+
+	// PROBE FIRST (review ruling 1): the A/V asset was created probe_status=pending
+	// at finalize (the API has no ffprobe). Probe it here, backfill the vault
+	// metadata, and use the MEASURED duration for the ceiling check — never a
+	// number the caller supplied. A genuinely unprobeable object fails the asset.
+	srcProbe, err := w.prober.ProbeAV(ctx, srcPath)
+	if err != nil {
+		if merr := w.store.MarkProbeFailed(ctx, job.Asset); merr != nil {
+			w.log.Error("mark probe failed", "asset", job.Asset, "err", merr)
+		}
+		return fmt.Errorf("probe source: %w", err)
+	}
+	if berr := w.store.BackfillVaultProbe(ctx, job.Asset, vaultRecordFromProbe(srcProbe)); berr != nil {
+		return fmt.Errorf("backfill vault probe: %w", berr)
+	}
+
+	// CEILING ENFORCEMENT (spec §4.3, §5.4): detail is bounded to the duration
+	// ceiling. On breach, do NOT transcode — write a FAILED rendition carrying the
+	// closed-enum reason, so delivery returns delivery:null + reason (the honest
+	// refusal). This is a job SUCCESS (the refusal is the correct outcome), not a
+	// job failure to retry.
+	if job.Intent == plate.Detail && w.detailMaxDurationS > 0 && srcProbe.DurationS > w.detailMaxDurationS {
+		w.log.Info("detail refused: over duration ceiling",
+			"asset", job.Asset, "duration_s", srcProbe.DurationS, "ceiling_s", w.detailMaxDurationS)
+		if rerr := w.store.FailedRenditionForCeiling(ctx, job.Asset, job.Intent, plate.ReasonCodeExceededDurationCeiling); rerr != nil {
+			return fmt.Errorf("write ceiling-refusal rendition: %w", rerr)
+		}
+		// Mark the job succeeded (the refusal was recorded); no rendition object.
+		return w.store.CompleteJobNoRendition(ctx, job.ID)
 	}
 
 	// Heartbeat while the transcode runs so a long job's lease is not reclaimed.
@@ -249,10 +330,11 @@ func (w *Worker) upload(ctx context.Context, src, key, ctype string) error {
 	return w.storage.Put(ctx, key, ctype, f, fi.Size())
 }
 
-// renditionKey is the deterministic object key for a rendition:
-// {vault-key}/{intent}. Deterministic so a re-run overwrites (idempotent).
+// renditionKey delegates to id.RenditionKey — the SHARED key function both the
+// worker (write) and delivery (URL) use, so the object the worker writes and the
+// URL delivery builds cannot drift.
 func renditionKey(vaultKey string, intent plate.Intent) string {
-	return vaultKey + "/" + string(intent)
+	return id.RenditionKey(vaultKey, string(intent))
 }
 
 func outputExt(intent plate.Intent) string {

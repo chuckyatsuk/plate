@@ -75,6 +75,17 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Granted-mode enforcement is NOT built yet (review ruling 3): a `grant` param
+	// means the caller wants granted delivery, which requires a live per-request
+	// grant check we have not implemented. Returning a working URL here would be a
+	// URL that ignores revocation — the exact "copied link works forever" failure
+	// grants exist to kill. So refuse loudly with 501 rather than silently degrade
+	// to public. (signed mode is likewise not caller-selectable yet.)
+	if r.URL.Query().Get("grant") != "" {
+		writeError(w, http.StatusNotImplemented, "not_implemented", "granted-mode delivery is not yet implemented")
+		return
+	}
+
 	// The account-scoped read: this asset must exist AND belong to the caller.
 	// A B-owned asset is ErrNotFound here — the isolation boundary for delivery.
 	asset, err := s.store.GetAsset(r.Context(), acct, assetID)
@@ -82,13 +93,68 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	res, err := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
-	if err != nil {
-		// Unroutable kind fails loud — never a 200 to a metered CDN.
-		writeError(w, http.StatusInternalServerError, "unroutable", "no delivery route for this media kind")
+	// original is the named escape hatch (spec §4.1): a short-lived authenticated
+	// download URL, independent of rendition state. It resolves even while an A/V
+	// asset is still probing. NOTE: its signature is a KNOWN-FORGEABLE placeholder
+	// until delivery signing lands (review ruling 3); a test pins that it is
+	// currently unsigned so this cannot be mistaken for done.
+	if intent == plate.Original {
+		res, rerr := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
+		if rerr != nil {
+			writeError(w, http.StatusInternalServerError, "unroutable", "no delivery route for this media kind")
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
 		return
 	}
-	writeJSON(w, http.StatusOK, res)
+
+	writeJSON(w, http.StatusOK, s.resolveNonOriginal(intent, asset))
+}
+
+// resolveNonOriginal resolves a non-original intent against the asset's real
+// rendition/probe state (review ruling 1 — delivery-side ceiling + readiness).
+//
+//   - image intents: imgproxy transforms on the fly from the vault original, so a
+//     ready image asset resolves immediately (no rendition row needed).
+//   - A/V intents (loop/detail): require a rendition. ready → URL; failed →
+//     delivery:null + the rendition's reason (the §4.3 honest refusal, e.g.
+//     exceeded_duration_ceiling); pending/absent → delivery:null, reason:pending.
+func (s *Service) resolveNonOriginal(intent plate.Intent, asset plate.Asset) plate.DeliveryResolution {
+	// A failed/pending PROBE blocks everything derived from the object.
+	// (probe_status lives on the asset; exposed via the store as a field.)
+	if asset.Kind == plate.Image || asset.Kind == plate.Document {
+		res, err := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
+		if err != nil {
+			reason := plate.ReasonCodeUnsupportedFormat
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
+		}
+		return res
+	}
+
+	// A/V: find the rendition for this intent.
+	for _, rend := range asset.Renditions {
+		if rend.Intent != intent {
+			continue
+		}
+		switch rend.Status {
+		case plate.RenditionStatus("ready"):
+			res, err := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
+			if err != nil {
+				reason := plate.ReasonCodeUnsupportedFormat
+				return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
+			}
+			return res
+		case plate.RenditionStatus("failed"):
+			// The honest refusal — carry the rendition's closed-enum reason.
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: rend.Reason}
+		default: // pending
+			pending := plate.ReasonCodePending
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &pending}
+		}
+	}
+	// No rendition yet (worker hasn't produced it) → pending.
+	pending := plate.ReasonCodePending
+	return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &pending}
 }
 
 func validIntent(i plate.Intent) bool {

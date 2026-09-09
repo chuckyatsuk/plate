@@ -167,6 +167,16 @@ func (p *Postgres) CompleteJob(ctx context.Context, jobID string, rend Rendition
 	return tx.Commit(ctx)
 }
 
+// CompleteJobNoRendition marks a job succeeded WITHOUT writing a rendition object
+// — used when the worker's correct outcome is a refusal (e.g. a ceiling breach
+// already recorded as a failed rendition row). The job did its work; there is
+// simply no deliverable object.
+func (p *Postgres) CompleteJobNoRendition(ctx context.Context, jobID string) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE jobs SET status = 'succeeded', progress = 1, updated = now() WHERE id = $1`, jobID)
+	return err
+}
+
 // FailJob records a job failure. If attempts remain below maxAttempts it is
 // re-queued (recoverable — the vault original still exists, spec §5.2); otherwise
 // it is marked failed with a closed-enum reason the delivery path surfaces.
@@ -186,6 +196,95 @@ func (p *Postgres) FailJob(ctx context.Context, jobID string, maxAttempts int32,
 	_, err := p.pool.Exec(ctx, `
 		UPDATE jobs SET status = 'failed', reason = $2, last_error = $3, updated = now()
 		WHERE id = $1`, jobID, string(reason), errMsg)
+	return err
+}
+
+// DeletedAsset is an asset marked for deletion whose bytes the purge sweep must
+// remove — the vault key plus the asset id (review ruling 4). The scheduled purge
+// is a follow-up job; this query lands now so "two-step delete" is one step and a
+// PROVEN query, not one step and a promise.
+type DeletedAsset struct {
+	ID       string
+	Account  string
+	VaultKey string
+}
+
+// ReclaimableDeletedAssets returns assets marked deleted (deleted_at set) before
+// the cutoff — the purge sweep's input. Ordered oldest-first, limited.
+func (p *Postgres) ReclaimableDeletedAssets(ctx context.Context, olderThan time.Time, limit int32) ([]DeletedAsset, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, account, vault_key
+		FROM assets
+		WHERE deleted_at IS NOT NULL AND deleted_at < $1
+		ORDER BY deleted_at
+		LIMIT $2`, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []DeletedAsset{}
+	for rows.Next() {
+		var d DeletedAsset
+		if err := rows.Scan(&d.ID, &d.Account, &d.VaultKey); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// PurgeDeletedAsset removes an asset row after its bytes are deleted (the second
+// step of the two-step delete). Renditions cascade via the FK.
+func (p *Postgres) PurgeDeletedAsset(ctx context.Context, assetID string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM assets WHERE id = $1 AND deleted_at IS NOT NULL`, assetID)
+	return err
+}
+
+// BackfillVaultProbe records probe metadata the WORKER measured for an A/V asset
+// that was created probe_status=pending at finalize (review ruling 1), and marks
+// it ready. Account-scoped via the asset id (the job carried the account).
+func (p *Postgres) BackfillVaultProbe(ctx context.Context, assetID string, v VaultRecord) error {
+	_, err := p.pool.Exec(ctx, `
+		UPDATE assets SET
+			vault_width = $2, vault_height = $3, vault_duration_s = $4,
+			vault_codec = $5, vault_container = $6,
+			probe_status = 'ready'
+		WHERE id = $1`,
+		assetID, v.Width, v.Height, v.DurationS, v.Codec, v.Container)
+	return err
+}
+
+// MarkProbeFailed flags an asset whose object could not be probed (corrupt or
+// unsupported). Delivery then refuses with a closed-enum reason.
+func (p *Postgres) MarkProbeFailed(ctx context.Context, assetID string) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE assets SET probe_status = 'failed' WHERE id = $1`, assetID)
+	return err
+}
+
+// MarkChecksumVerified records that the stored object's checksum was confirmed
+// (server-side, ETag, or worker hash) and stores the verified value. Never called
+// with an unverified client claim (review ruling 2).
+func (p *Postgres) MarkChecksumVerified(ctx context.Context, assetID, checksum string) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE assets SET vault_checksum = $2, checksum_verified = true WHERE id = $1`,
+		assetID, checksum)
+	return err
+}
+
+// FailedRenditionForCeiling writes a failed rendition row for an intent the
+// worker refused because a ceiling was breached (e.g. detail over the duration
+// ceiling), carrying the closed-enum reason. Delivery surfaces it as
+// delivery:null + reason (§4.3 honest refusal). One row per (asset,intent).
+func (p *Postgres) FailedRenditionForCeiling(ctx context.Context, assetID string, intent plate.Intent, reason plate.ReasonCode) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO renditions (asset, intent, status, reason)
+		VALUES ($1, $2, 'failed', $3)
+		ON CONFLICT (asset, intent) DO UPDATE SET status = 'failed', reason = EXCLUDED.reason`,
+		assetID, string(intent), string(reason))
 	return err
 }
 
