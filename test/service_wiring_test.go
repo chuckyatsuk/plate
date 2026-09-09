@@ -289,6 +289,44 @@ var (
 	storeOnce      sync.Once
 )
 
+// freshStore starts a BRAND-NEW ephemeral Postgres (container + migrations + the
+// reconcile account), fully isolated from other tests. Use it where a test needs
+// exclusive control of table contents — e.g. the queue tests, whose "nothing
+// else is claimable" assertions depend on the queue holding only their own jobs.
+// Terminated when the test finishes.
+func freshStore(t *testing.T) *store.Postgres {
+	t.Helper()
+	harness.RequireDocker(t)
+	ctx := context.Background()
+	pg, err := tcpostgres.Run(ctx, "postgres:16-alpine",
+		tcpostgres.WithDatabase("plate"),
+		tcpostgres.WithUsername("plate"),
+		tcpostgres.WithPassword("plate"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("freshStore: start postgres: %v", err)
+	}
+	t.Cleanup(func() { _ = pg.Terminate(context.Background()) })
+	conn, err := pg.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("freshStore: conn string: %v", err)
+	}
+	if err := store.Migrate(ctx, conn); err != nil {
+		t.Fatalf("freshStore: migrate: %v", err)
+	}
+	st, err := store.Open(ctx, conn)
+	if err != nil {
+		t.Fatalf("freshStore: open: %v", err)
+	}
+	t.Cleanup(st.Close)
+	if _, err := st.Pool().Exec(ctx,
+		`INSERT INTO accounts (id) VALUES ($1) ON CONFLICT DO NOTHING`, reconcileAccount); err != nil {
+		t.Fatalf("freshStore: seed account: %v", err)
+	}
+	return st
+}
+
 // storeForTest returns the shared ephemeral store, starting it (Postgres
 // container + migrations + a seeded account) on first use. Skips the test if
 // Docker is unavailable — the same visible behavior as the other container tests.

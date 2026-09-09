@@ -1,0 +1,37 @@
+# Plate worker on Fly.io (spec Q4 — RESOLVED 2026-09-09: Fly.io now, host-agnostic;
+# Cloud Run Jobs / a custom box remain a deploy change, not a rewrite). This
+# manifest deploys ONLY the worker (`plate work`); the API runs on Vercel/its own
+# target, and both point at the same Postgres + R2.
+#
+# ⚠️ NOT DEPLOYED from this repo yet — this file exists so the phase is concrete
+# and the config questions are answered. A real deploy needs R2 + Supabase creds
+# (set as Fly secrets), which are not provisioned here.
+
+app = "plate-worker"
+primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/queue lookups in-region)
+
+[build]
+  dockerfile = "Dockerfile.worker"
+
+[processes]
+  worker = "work"
+
+# The workload is bursty ingest, idle most of the time (spec Q4): scale to zero
+# when the queue is empty, spin up on demand. No public services — the worker
+# pulls jobs from Postgres, it does not serve HTTP.
+[[vm]]
+  # ⚠️ performance CPU, never shared: ffmpeg on a throttled shared vCPU crawls and
+  # would blow the duration ceilings (spec Q4).
+  size = "performance-2x"  # 2 perf CPU / 4GB — a 12-min source ~30min compute
+  memory = "4gb"
+
+# Scratch: prefer the machine's ephemeral disk over a Fly Volume (a Volume bills
+# whether attached or not, spec Q4). PLATE_WORKER_SCRATCH_DIR is set in the image.
+
+# Secrets (set with `fly secrets set`, NEVER committed):
+#   DATABASE_URL, R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+#   R2_DEFAULT_BUCKET, R2_REGION
+[env]
+  PLATE_ENV = "production"
+  PLATE_LOG_LEVEL = "info"
+  PLATE_WORKER_CONCURRENCY = "1"

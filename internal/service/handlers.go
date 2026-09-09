@@ -195,13 +195,14 @@ func (s *Service) handleRequestRendition(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// A/V intents need the worker (transcode). That is PR-(b); until the worker
-	// lands, an A/V rendition request is honestly reported as pending rather than
-	// enqueued. The account-safety (ownership check above) already holds.
-	writeJSON(w, http.StatusAccepted, plate.Rendition{
-		Intent: req.Intent,
-		Status: plate.RenditionStatus("pending"),
-	})
+	// A/V intents need the worker (transcode): enqueue a job and return 202 with
+	// its state (spec §5.2). Idempotent per (asset, intent). The ownership check
+	// above already established account-safety.
+	job, err := s.store.EnqueueJob(r.Context(), acct, assetID, req.Intent)
+	if mapStoreErr(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
 }
 
 func (s *Service) handleGetJob(w http.ResponseWriter, r *http.Request) {

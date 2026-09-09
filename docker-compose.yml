@@ -102,6 +102,33 @@ services:
       mc mb --ignore-existing local/plate &&
       echo 'bucket ready'"
 
+  # The transcode worker (spec §5.2, Q4): same binary as plate-api, the `work`
+  # command, built from Dockerfile.worker (which carries ffmpeg — the api image
+  # does not). It claims A/V jobs from Postgres (SKIP LOCKED), pulls originals
+  # from MinIO, transcodes, and writes renditions back. Scales horizontally by
+  # raising the replica count; SKIP LOCKED keeps N workers safe.
+  plate-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: ["work"]
+    environment:
+      PLATE_ENV: development
+      PLATE_LOG_LEVEL: info
+      DATABASE_URL: "postgres://plate:plate@postgres:5432/plate?sslmode=disable"
+      R2_ENDPOINT: "http://minio:9000"
+      R2_REGION: "us-east-1"
+      R2_ACCESS_KEY_ID: "plate"
+      R2_SECRET_ACCESS_KEY: "plate-secret"
+      R2_DEFAULT_BUCKET: "plate"
+      PLATE_S3_PATH_STYLE: "true"
+      PLATE_WORKER_SCRATCH_DIR: "/scratch"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
 volumes:
   plate-pgdata:
   plate-miniodata:

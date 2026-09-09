@@ -90,6 +90,11 @@ type Store interface {
 	// §5.1). The sweep itself is Phase 2b (the worker); this read exists now so the
 	// requirement is HELD by a test (decision D5), not just a table.
 	ReclaimableUploads(ctx context.Context, olderThan time.Time, limit int32) ([]Upload, error)
+
+	// EnqueueJob queues an A/V derivation job for an owned asset (spec §5.2).
+	// Idempotent per (asset, intent). Account-scoped; the caller confirms
+	// ownership before enqueue.
+	EnqueueJob(ctx context.Context, account, assetID string, intent plate.Intent) (plate.Job, error)
 }
 
 // Upload is a brokered upload record (spec §5.1). The account is derived from the
