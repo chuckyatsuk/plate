@@ -959,7 +959,7 @@ components:
           type: integer
           format: int64
           minimum: 1
-          description: Exact or upper-bound byte size. Bound into the presigned PUT's content-length range.
+          description: Exact declared byte size. Bound into the presigned PUT's signature as the exact content-length — the object must be exactly this many bytes (a presigned PUT signs an exact length, not a range).
         filename:
           type: string
           description: Optional human-readable name, recorded as metadata.

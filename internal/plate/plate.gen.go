@@ -506,7 +506,7 @@ type UploadRequest struct {
 	// Filename Optional human-readable name, recorded as metadata.
 	Filename *string `json:"filename,omitempty"`
 
-	// SizeBytes Exact or upper-bound byte size. Bound into the presigned PUT's content-length range.
+	// SizeBytes Exact declared byte size. Bound into the presigned PUT's signature as the exact content-length — the object must be exactly this many bytes (a presigned PUT signs an exact length, not a range).
 	SizeBytes int64 `json:"size_bytes"`
 }
 
