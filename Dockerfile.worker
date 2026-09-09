@@ -1,0 +1,22 @@
+# Plate worker image (spec Q4): same binary as the API, different command
+# (`plate work`), but this image carries the fat ffmpeg runtime the transcode
+# path needs — kept OUT of the API image so the API stays small and fast to cold-
+# start. This is the "split from day one" discipline realized at the image layer.
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/plate ./cmd/plate
+
+FROM alpine:3.20
+# ffmpeg + ca-certificates. The worker shells to ffmpeg/ffprobe for transcodes
+# (spec §5.2); the API image deliberately omits them.
+RUN apk add --no-cache ca-certificates ffmpeg
+COPY --from=build /out/plate /usr/local/bin/plate
+# Scratch disk for transcode work (spec Q4: real disk, not tmpfs). A deployment
+# mounts a volume or uses the machine's ephemeral disk here.
+ENV PLATE_WORKER_SCRATCH_DIR=/scratch
+RUN mkdir -p /scratch
+ENTRYPOINT ["plate"]
+CMD ["work"]
