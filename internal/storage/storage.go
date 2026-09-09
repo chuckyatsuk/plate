@@ -22,6 +22,7 @@ package storage
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -89,20 +90,23 @@ type Storage interface {
 	// Get streams an object's bytes — the worker pulling a vault original.
 	Get(ctx context.Context, key string) (ReadCloser, error)
 
-	// Put writes bytes to a key — the worker writing a rendition.
-	Put(ctx context.Context, key, contentType string, r Reader, size int64) error
+	// GetRange streams only bytes [start, start+length) of an object — used by the
+	// API's image probe to read just the header (~64KB) rather than downloading a
+	// multi-hundred-MB original into a sub-100ms request (review ruling 1). Fewer
+	// bytes than requested at EOF is normal.
+	GetRange(ctx context.Context, key string, start, length int64) (ReadCloser, error)
+
+	// Put writes bytes to a key — the worker writing a rendition. The reader
+	// SHOULD be an io.ReadSeeker (e.g. an *os.File) so the SDK can sign and, if
+	// needed, rewind the body; a non-seekable reader with a set ContentLength can
+	// be sent as a zero-length body by the SDK (a silent empty write — the exact
+	// bug the deployed smoke caught). Passing the concrete *os.File keeps Seek.
+	Put(ctx context.Context, key, contentType string, r io.Reader, size int64) error
 
 	// Delete removes an object — the reconciliation sweep and two-step delete
 	// (spec §5.1, Q2).
 	Delete(ctx context.Context, key string) error
 }
 
-// Reader / ReadCloser are aliased so callers don't import io just for the
-// signatures; the s3 impl uses the standard ones.
-type (
-	Reader     = interface{ Read(p []byte) (int, error) }
-	ReadCloser = interface {
-		Read(p []byte) (int, error)
-		Close() error
-	}
-)
+// ReadCloser is the return type for Get/GetRange (io.ReadCloser under the hood).
+type ReadCloser = io.ReadCloser

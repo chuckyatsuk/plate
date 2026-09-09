@@ -43,6 +43,13 @@ func New(ctx context.Context, cfg Config) (*S3, error) {
 		UsePathStyle: cfg.UsePathStyle,
 		Credentials: credentials.NewStaticCredentialsProvider(
 			cfg.AccessKey, cfg.SecretKey, ""),
+		// S3-compatible backends (R2, MinIO) do not all handle aws-sdk-go-v2's
+		// default request-checksum trailer (CRC32 over aws-chunked streaming). With
+		// it on, a PutObject can "succeed" while the object is never stored — a
+		// silent empty write (the deployed-smoke bug). Only send a checksum when the
+		// operation requires one; this is the standard setting for non-AWS S3.
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
 	return &S3{
 		client:  client,
@@ -154,12 +161,27 @@ func (s *S3) Get(ctx context.Context, key string) (ReadCloser, error) {
 	return out.Body, nil
 }
 
+// GetRange streams bytes [start, start+length) via an HTTP Range request, so the
+// image probe reads only the header instead of the whole original.
+func (s *S3) GetRange(ctx context.Context, key string, start, length int64) (ReadCloser, error) {
+	rng := fmt.Sprintf("bytes=%d-%d", start, start+length-1)
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(rng),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("storage: get range %s %s: %w", key, rng, err)
+	}
+	return out.Body, nil
+}
+
 // Put writes bytes — the worker writing a rendition.
-func (s *S3) Put(ctx context.Context, key, contentType string, r Reader, size int64) error {
+func (s *S3) Put(ctx context.Context, key, contentType string, r io.Reader, size int64) error {
 	in := &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
 		Key:         aws.String(key),
-		Body:        io.Reader(r),
+		Body:        r,
 		ContentType: aws.String(contentType),
 	}
 	if size > 0 {
