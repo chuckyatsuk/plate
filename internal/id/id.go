@@ -64,3 +64,14 @@ func encode(b [16]byte) string {
 func VaultKey(account, assetID string) string {
 	return account + "/" + assetID
 }
+
+// RenditionKey returns the storage key for a rendition derived from a vault
+// original: `{vault-key}/{intent}`. It is SHARED by the worker (which writes the
+// object here) and the delivery layer (which builds the URL pointing here) so the
+// two cannot drift — a rendition marked ready must resolve to the exact bytes the
+// worker wrote (the deployed-smoke bug: delivery pointed at a different path than
+// the worker wrote). The intent is passed as a string so this package stays free
+// of the generated contract types.
+func RenditionKey(vaultKey, intent string) string {
+	return vaultKey + "/" + intent
+}
