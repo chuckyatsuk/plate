@@ -169,23 +169,39 @@ func (s *Service) handleRequestRendition(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Phase 1 is read-path/images-only/no-worker (spec §8). Generation itself is
-	// Phase 2; here we confirm the caller owns the asset and return the existing
-	// rendition set for the intent if present. If not present, this is a Phase-2
-	// no-op that must still be account-safe.
 	asset, err := s.store.GetAsset(r.Context(), acct, assetID)
 	if mapStoreErr(w, err) {
 		return
 	}
+
+	// An already-existing rendition for this intent is returned as-is (idempotent
+	// per (asset, intent), per the contract).
 	for _, rend := range asset.Renditions {
 		if rend.Intent == req.Intent {
 			writeJSON(w, http.StatusOK, rend)
 			return
 		}
 	}
-	// No existing rendition and no worker in Phase 1: report it as pending so the
-	// caller has an actionable, account-safe answer.
-	writeJSON(w, http.StatusOK, plate.Rendition{Intent: req.Intent, Status: plate.RenditionStatus("pending")})
+
+	// Image intents resolve SYNCHRONOUSLY (spec §5.2): imgproxy transforms on the
+	// fly from the vault original, so a ready rendition needs no generation job —
+	// the delivery URL is a signed preset URL. The `original` escape hatch is
+	// image-independent and also synchronous.
+	if asset.Kind == plate.Image || req.Intent == plate.Original {
+		writeJSON(w, http.StatusOK, plate.Rendition{
+			Intent: req.Intent,
+			Status: plate.RenditionStatus("ready"),
+		})
+		return
+	}
+
+	// A/V intents need the worker (transcode). That is PR-(b); until the worker
+	// lands, an A/V rendition request is honestly reported as pending rather than
+	// enqueued. The account-safety (ownership check above) already holds.
+	writeJSON(w, http.StatusAccepted, plate.Rendition{
+		Intent: req.Intent,
+		Status: plate.RenditionStatus("pending"),
+	})
 }
 
 func (s *Service) handleGetJob(w http.ResponseWriter, r *http.Request) {

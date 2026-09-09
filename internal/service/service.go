@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/chuckyatsuk/plate/internal/auth"
+	"github.com/chuckyatsuk/plate/internal/probe"
+	"github.com/chuckyatsuk/plate/internal/storage"
 	"github.com/chuckyatsuk/plate/internal/store"
 )
 
@@ -24,18 +26,45 @@ type Config struct {
 	Store    store.Store
 	Verifier *auth.Verifier
 	URLs     URLBuilder
+
+	// Storage and Prober are the write-path dependencies (Phase 2). They are nil
+	// on a read-only deployment; the write handlers guard on nil and return 501 so
+	// a read-path-only service is honest rather than panicking.
+	Storage storage.Storage
+	Prober  *probe.Prober
+
+	// UploadTTL and UploadMaxBytes bound the presigned PUT (spec Q3.C). Zero
+	// values fall back to safe defaults.
+	UploadTTL      time.Duration
+	UploadMaxBytes int64
 }
 
 // Service holds the wired dependencies and exposes an http.Handler (Router).
 type Service struct {
-	store store.Store
-	verf  *auth.Verifier
-	urls  URLBuilder
+	store          store.Store
+	verf           *auth.Verifier
+	urls           URLBuilder
+	storage        storage.Storage
+	prober         *probe.Prober
+	uploadTTL      time.Duration
+	uploadMaxBytes int64
 }
 
 // New builds a Service from Config.
 func New(cfg Config) *Service {
-	return &Service{store: cfg.Store, verf: cfg.Verifier, urls: cfg.URLs}
+	ttl := cfg.UploadTTL
+	if ttl <= 0 {
+		ttl = time.Hour // generous for a studio's slow connection (spec Q3.C)
+	}
+	return &Service{
+		store:          cfg.Store,
+		verf:           cfg.Verifier,
+		urls:           cfg.URLs,
+		storage:        cfg.Storage,
+		prober:         cfg.Prober,
+		uploadTTL:      ttl,
+		uploadMaxBytes: cfg.UploadMaxBytes,
+	}
 }
 
 // expiresSoon is the short expiry for signed/original URLs. Kept here so the
