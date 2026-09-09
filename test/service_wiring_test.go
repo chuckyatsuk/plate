@@ -21,22 +21,28 @@ package plate_test
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/chuckyatsuk/plate/internal/auth"
+	"github.com/chuckyatsuk/plate/internal/probe"
 	"github.com/chuckyatsuk/plate/internal/service"
+	"github.com/chuckyatsuk/plate/internal/storage"
 	"github.com/chuckyatsuk/plate/internal/store"
 	"github.com/chuckyatsuk/plate/test/harness"
 	"github.com/chuckyatsuk/plate/test/support"
 
 	"github.com/golang-jwt/jwt/v5"
+	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
@@ -99,9 +105,22 @@ func runWithService(m *testing.M) int {
 	pub, priv := auth.TestKeyPair()
 	verf := auth.NewVerifier(pub, "", "") // issuer/aud checks off in test
 
+	// A real storage backend (MinIO) + prober so the WRITE endpoints are exercised
+	// under isolation for real (condition C3: isolation grows with the write path).
+	// The cross-account write assertions fire on the account-scoped DB lookups
+	// (GetUpload/AssetOwnedBy) BEFORE any storage call, but storage must be present
+	// for the handler to reach that check rather than 501.
+	stor, prober, storErr := startStorageForWiring(ctx)
+	if storErr != nil {
+		fmt.Fprintf(os.Stderr, "plate_test: storage for wiring: %v\n", storErr)
+		return m.Run() // skip-pending rather than fail the whole suite
+	}
+
 	svc := service.New(service.Config{
 		Store:    st,
 		Verifier: verf,
+		Storage:  stor,
+		Prober:   prober,
 		URLs: service.URLBuilder{
 			ImageCDNBase: "https://cdn.example",
 			R2PublicBase: "https://r2.example",
@@ -256,6 +275,97 @@ func (rs *realService) MintUploadKey(caller support.Actor, requestedAccountHint 
 	return key, resp
 }
 
+// ── shared ephemeral Postgres for direct store-level tests ──────────────────
+
+const reconcileAccount = "acct-reconcile"
+
+// sharedStore is an ephemeral Postgres store, started once, that direct
+// store-level tests (e.g. the reconciliation test) use via storeForTest. It is
+// separate from the isolation service's store so those tests don't interfere.
+var (
+	sharedStore    *store.Postgres
+	sharedStoreErr error
+	sharedStoreCtx = context.Background()
+	storeOnce      sync.Once
+)
+
+// storeForTest returns the shared ephemeral store, starting it (Postgres
+// container + migrations + a seeded account) on first use. Skips the test if
+// Docker is unavailable — the same visible behavior as the other container tests.
+func storeForTest(t *testing.T) *store.Postgres {
+	t.Helper()
+	harness.RequireDocker(t)
+	storeOnce.Do(func() {
+		pg, err := tcpostgres.Run(sharedStoreCtx, "postgres:16-alpine",
+			tcpostgres.WithDatabase("plate"),
+			tcpostgres.WithUsername("plate"),
+			tcpostgres.WithPassword("plate"),
+			tcpostgres.BasicWaitStrategies(),
+		)
+		if err != nil {
+			sharedStoreErr = err
+			return
+		}
+		conn, err := pg.ConnectionString(sharedStoreCtx, "sslmode=disable")
+		if err != nil {
+			sharedStoreErr = err
+			return
+		}
+		if err := store.Migrate(sharedStoreCtx, conn); err != nil {
+			sharedStoreErr = err
+			return
+		}
+		st, err := store.Open(sharedStoreCtx, conn)
+		if err != nil {
+			sharedStoreErr = err
+			return
+		}
+		if _, err := st.Pool().Exec(sharedStoreCtx,
+			`INSERT INTO accounts (id) VALUES ($1) ON CONFLICT DO NOTHING`, reconcileAccount); err != nil {
+			sharedStoreErr = err
+			return
+		}
+		sharedStore = st
+	})
+	if sharedStoreErr != nil {
+		t.Fatalf("shared store: %v", sharedStoreErr)
+	}
+	return sharedStore
+}
+
+// startStorageForWiring stands up a MinIO container and a prober for the isolation
+// wiring. It is the no-*testing.T analog of harness.StartMinIO (TestMain has no T).
+// The container is terminated when the process exits (tests own the lifetime).
+func startStorageForWiring(ctx context.Context) (*storage.S3, *probe.Prober, error) {
+	const user, pass, bucket = "plate", "plate-secret", "plate-isolation"
+	c, err := tcminio.Run(ctx, "minio/minio:latest",
+		tcminio.WithUsername(user), tcminio.WithPassword(pass))
+	if err != nil {
+		return nil, nil, err
+	}
+	// Not terminated explicitly: the container is reaped by testcontainers' ryuk
+	// when the test process exits. (TestMain has no t.Cleanup.)
+	endpoint, err := c.ConnectionString(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := storage.New(ctx, storage.Config{
+		Endpoint:     "http://" + endpoint,
+		Region:       "us-east-1",
+		AccessKey:    user,
+		SecretKey:    pass,
+		Bucket:       bucket,
+		UsePathStyle: true,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := st.EnsureBucket(ctx); err != nil {
+		return nil, nil, err
+	}
+	return st, probe.New(""), nil
+}
+
 // authRegisteredClaims builds a valid, short-lived set of registered claims for
 // a test token (a real expiry so the verifier's exp check is exercised).
 func authRegisteredClaims() jwt.RegisteredClaims {
@@ -269,28 +379,27 @@ func authRegisteredClaims() jwt.RegisteredClaims {
 // farFuture is an RFC3339 timestamp a day out, for grant expiry in request bodies.
 func farFuture() string { return time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339) }
 
-// keyFromTicket extracts the {account}/{asset-id} key from the ticket's PUT URL.
-// The URL is `<r2base>/<account>/<asset-id>`, so the key is everything after the
-// base host+scheme's last two path segments — simplest: take the last two path
-// segments joined by "/".
+// keyFromTicket extracts the {account}/{asset-id} key from the ticket's real
+// presigned PUT URL. A path-style presigned URL is
+// `http://host:port/{bucket}/{account}/{asset-id}?X-Amz-...`, so the key is the
+// last TWO segments of the URL PATH (ignoring the query). JSON-decoding the
+// ticket first avoids mishandling escaped characters in the signed query.
 func keyFromTicket(body []byte) string {
-	s := string(body)
-	// Find the "url":"..." field.
-	const marker = `"url":"`
-	i := strings.Index(s, marker)
-	if i < 0 {
+	var ticket struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &ticket); err != nil || ticket.URL == "" {
 		return ""
 	}
-	rest := s[i+len(marker):]
-	j := strings.IndexByte(rest, '"')
-	if j < 0 {
+	u, err := neturl.Parse(ticket.URL)
+	if err != nil {
 		return ""
 	}
-	url := rest[:j]
-	// key = last two path segments.
-	parts := strings.Split(url, "/")
-	if len(parts) < 2 {
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(segs) < 2 {
 		return ""
 	}
-	return parts[len(parts)-2] + "/" + parts[len(parts)-1]
+	// key = last two path segments: {account}/{asset-id}. The bucket (and any
+	// prefix) precede them and are dropped.
+	return segs[len(segs)-2] + "/" + segs[len(segs)-1]
 }

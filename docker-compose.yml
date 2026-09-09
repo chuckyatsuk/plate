@@ -22,14 +22,25 @@ services:
       DATABASE_URL: "postgres://plate:plate@postgres:5432/plate?sslmode=disable"
       # Image transforms via imgproxy (ONLY_PRESETS enforced in imgproxy).
       IMGPROXY_BASE_URL: "http://imgproxy:8080"
-      # Pass-through bytes (AV, documents, originals) serve from R2 in production;
-      # for a local-only quickstart these can point at any S3-compatible base.
-      R2_PUBLIC_BASE: "http://localhost:9000"
+      # Storage: MinIO stands in for R2 in the quickstart (S3-compatible, spec Q5),
+      # so `docker compose up` gives a full WRITE path with nothing external — the
+      # same parity discipline as the goose migrations. Production points these at
+      # R2 instead. Path-style addressing is required for MinIO.
+      R2_ENDPOINT: "http://minio:9000"
+      R2_REGION: "us-east-1"
+      R2_ACCESS_KEY_ID: "plate"
+      R2_SECRET_ACCESS_KEY: "plate-secret"
+      R2_DEFAULT_BUCKET: "plate"
+      R2_PUBLIC_BASE: "http://localhost:9000/plate"
+      PLATE_S3_PATH_STYLE: "true"
+      PLATE_UPLOAD_URL_TTL: "1h"
       # Token validation: supply a base64 raw Ed25519 public key. Empty here so a
       # stranger can boot and read the health endpoints; set it to accept tokens.
       PLATE_JWT_PUBLIC_KEY: "${PLATE_JWT_PUBLIC_KEY:-}"
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   postgres:
@@ -57,5 +68,40 @@ services:
     ports:
       - "8081:8080"
 
+  # MinIO is the R2 stand-in for the quickstart (S3-compatible, spec Q5). It is
+  # NOT how production runs — production points the R2_* vars at Cloudflare R2 —
+  # but shipping it means `docker compose up` gives a stranger a working write
+  # path with nothing external, the same parity discipline as the Postgres
+  # container and the goose migrations.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "plate"
+      MINIO_ROOT_PASSWORD: "plate-secret"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - plate-miniodata:/data
+
+  # One-shot: create the bucket so plate-api can presign into it on first boot.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 plate plate-secret &&
+      mc mb --ignore-existing local/plate &&
+      echo 'bucket ready'"
+
 volumes:
   plate-pgdata:
+  plate-miniodata:

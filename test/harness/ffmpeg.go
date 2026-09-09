@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/chuckyatsuk/plate/internal/mediaspec"
 )
 
 // ffmpegBin / ffprobeBin resolve the engines from PATH, honouring the same env
@@ -86,14 +88,10 @@ func TranscodeDetail(t *testing.T, src, dst string) string {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatalf("harness: mkdir for transcode dst: %v", err)
 	}
-	args := []string{
-		"-hide_banner", "-y", "-i", src,
-		"-c:v", "libx264", "-preset", "ultrafast",
-		"-vf", "scale=-2:min(1080\\,ih)", // <=1080p, spec detail ceiling
-		"-c:a", "aac",
-		"-movflags", "+faststart", // unconditional, preset layer (spec §5.5)
-		dst,
-	}
+	// The args come from mediaspec — the SAME constants the real worker uses
+	// (condition C1). Only the encode preset differs (ultrafast for cheap
+	// fixtures), which does not affect the box order the faststart test checks.
+	args := mediaspec.DetailArgs(src, dst, "ultrafast")
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
@@ -114,12 +112,7 @@ func RemuxCopy(t *testing.T, src, dst string) string {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatalf("harness: mkdir for remux dst: %v", err)
 	}
-	args := []string{
-		"-hide_banner", "-y", "-i", src,
-		"-c", "copy",
-		"-movflags", "+faststart",
-		dst,
-	}
+	args := mediaspec.RemuxCopyArgs(src, dst)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
