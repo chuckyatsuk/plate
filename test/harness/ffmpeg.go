@@ -184,6 +184,39 @@ func Probe(t *testing.T, path string) ProbeResult {
 	return res
 }
 
+// HasAudioStream reports whether a file contains at least one audio stream. Used
+// to verify the loop tier is SILENT (spec §5.4) — the artifact, not the flag: it
+// asks ffprobe what streams the produced file actually has, rather than trusting
+// that -an was passed.
+func HasAudioStream(t *testing.T, path string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobeBin(),
+		"-hide_banner", "-v", "error",
+		"-select_streams", "a",
+		"-show_entries", "stream=index",
+		"-of", "csv=p=0", path,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("harness: ffprobe audio check on %s: %v", path, err)
+	}
+	return len(bytesTrimSpace(out)) > 0
+}
+
+// bytesTrimSpace trims surrounding whitespace without importing bytes for one use.
+func bytesTrimSpace(b []byte) []byte {
+	i, j := 0, len(b)
+	for i < j && (b[i] == ' ' || b[i] == '\n' || b[i] == '\r' || b[i] == '\t') {
+		i++
+	}
+	for j > i && (b[j-1] == ' ' || b[j-1] == '\n' || b[j-1] == '\r' || b[j-1] == '\t') {
+		j--
+	}
+	return b[i:j]
+}
+
 // FFmpegAvailable reports whether both ffmpeg and ffprobe are runnable. The AV
 // tests skip cleanly when they are absent (a bare dev machine) but CI installs
 // them, so the AV artifacts are actually verified there (spec §7 wants this in
