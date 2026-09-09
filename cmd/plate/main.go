@@ -67,10 +67,17 @@ func serve(log *slog.Logger) error {
 	defer st.Close()
 
 	// Write-path deps (storage + prober) are opt-in by config: absent R2 config
-	// means a read-path-only deployment (the write endpoints answer 501).
+	// means a read-path-only deployment (write endpoints answer 503). A PARTIAL R2
+	// config fails fast here rather than accepting traffic and erroring per request
+	// (review ruling 7).
 	sc, err := service.LoadStorage(ctx)
 	if err != nil {
 		return err
+	}
+	if sc.Storage != nil {
+		log.Info("write path enabled (storage configured)")
+	} else {
+		log.Info("read-path-only (no storage configured; write endpoints return 503)")
 	}
 
 	svc := service.New(service.Config{
@@ -132,12 +139,13 @@ func work(log *slog.Logger) error {
 	defer st.Close()
 
 	w := worker.New(worker.Config{
-		Store:      st,
-		Storage:    sc.Storage,
-		Transcoder: worker.NewFFmpegTranscoder(os.Getenv("PLATE_FFMPEG_PATH"), "", 0),
-		Prober:     sc.Prober,
-		Log:        log,
-		ScratchDir: os.Getenv("PLATE_WORKER_SCRATCH_DIR"),
+		Store:              st,
+		Storage:            sc.Storage,
+		Transcoder:         worker.NewFFmpegTranscoder(os.Getenv("PLATE_FFMPEG_PATH"), "", 0),
+		Prober:             sc.Prober,
+		Log:                log,
+		ScratchDir:         os.Getenv("PLATE_WORKER_SCRATCH_DIR"),
+		DetailMaxDurationS: service.DetailMaxDurationSeconds(), // PLATE_DETAIL_MAX_DURATION, default 720
 	})
 
 	// Graceful SIGTERM: cancel the loop's context so an in-flight job finishes or

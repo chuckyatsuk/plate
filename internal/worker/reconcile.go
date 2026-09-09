@@ -34,7 +34,10 @@ func NewReconciler(st *store.Postgres, stor storage.Storage, log *slog.Logger, g
 	if log == nil {
 		log = slog.Default()
 	}
-	if grace <= 0 {
+	// grace == 0 means "use the safe default". A NEGATIVE grace is an explicit "no
+	// window" (cutoff in the future → everything eligible), used by tests to purge
+	// immediately without a sub-second race on deleted_at < now().
+	if grace == 0 {
 		grace = 6 * time.Hour
 	}
 	if batchSize <= 0 {
@@ -65,4 +68,32 @@ func (r *Reconciler) SweepOnce(ctx context.Context) (int, error) {
 		cleaned++
 	}
 	return cleaned, nil
+}
+
+// SweepDeletedAssets is the second step of the two-step delete (review ruling 4,
+// spec Q2): deleteAsset marked intent (deleted_at); this removes the vault bytes
+// and then the asset row. Idempotent — a re-deleted object is a cheap no-op.
+// Returns the number of assets purged.
+func (r *Reconciler) SweepDeletedAssets(ctx context.Context) (int, error) {
+	cutoff := time.Now().Add(-r.grace)
+	deleted, err := r.store.ReclaimableDeletedAssets(ctx, cutoff, r.batchSize)
+	if err != nil {
+		return 0, err
+	}
+	purged := 0
+	for _, d := range deleted {
+		// Delete the vault original. (Rendition objects share the vault key prefix;
+		// a fuller sweep would list+delete them too — tracked as a follow-up.)
+		if err := r.storage.Delete(ctx, d.VaultKey); err != nil {
+			r.log.Warn("reconcile: delete deleted-asset bytes failed", "key", d.VaultKey, "err", err)
+			continue
+		}
+		if err := r.store.PurgeDeletedAsset(ctx, d.ID); err != nil {
+			r.log.Warn("reconcile: purge asset row failed", "asset", d.ID, "err", err)
+			continue
+		}
+		r.log.Info("reconcile: purged deleted asset", "asset", d.ID, "key", d.VaultKey)
+		purged++
+	}
+	return purged, nil
 }
