@@ -4,12 +4,25 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/chuckyatsuk/plate/internal/auth"
+	"github.com/chuckyatsuk/plate/internal/id"
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 	"github.com/chuckyatsuk/plate/internal/store"
 )
+
+// ownerOriginalSentinel is the "grant id" an owner's `original` download is
+// signed with. It is NOT a real grant — it marks the URL as the owner front
+// door, so an original signature and a granted signature are cryptographically
+// distinct: a grant id can never verify an original download, and this sentinel
+// can never verify a granted one. The download handler routes on the query
+// intent/grant and re-derives which one to verify against, so a forged swap
+// fails the HMAC. The value is fixed and non-secret (the key is the secret).
+const ownerOriginalSentinel = "\x00owner-original"
 
 // account pulls the caller's account from the verified token claim. This is the
 // ONLY source of the caller's account anywhere in the service (spec Q3.A). It is
@@ -75,14 +88,13 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Granted-mode enforcement is NOT built yet (review ruling 3): a `grant` param
-	// means the caller wants granted delivery, which requires a live per-request
-	// grant check we have not implemented. Returning a working URL here would be a
-	// URL that ignores revocation — the exact "copied link works forever" failure
-	// grants exist to kill. So refuse loudly with 501 rather than silently degrade
-	// to public. (signed mode is likewise not caller-selectable yet.)
-	if r.URL.Query().Get("grant") != "" {
-		writeError(w, http.StatusNotImplemented, "not_implemented", "granted-mode delivery is not yet implemented")
+	// Granted mode (spec Q3.B): a `grant` param means "serve this only if grant G
+	// still permits it." Unlike public/signed, this puts a live per-request check
+	// in the hot path — the whole point is that revocation and expiry actually
+	// stop the URL working. Handle it entirely here and return; it resolves the
+	// asset under the GRANT's account, not the caller's.
+	if grantID := r.URL.Query().Get("grant"); grantID != "" {
+		s.resolveGranted(w, r, grantID, assetID, intent)
 		return
 	}
 
@@ -94,21 +106,239 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 	}
 
 	// original is the named escape hatch (spec §4.1): a short-lived authenticated
-	// download URL, independent of rendition state. It resolves even while an A/V
-	// asset is still probing. NOTE: its signature is a KNOWN-FORGEABLE placeholder
-	// until delivery signing lands (review ruling 3); a test pins that it is
-	// currently unsigned so this cannot be mistaken for done.
+	// download URL, independent of rendition state — it resolves even while an A/V
+	// asset is still probing. It is the OWNER's front door to raw bytes (the caller
+	// here is token-authenticated and owns the asset, checked just above), so it is
+	// signed with the owner sentinel, NOT a grant — a grant can never mint one
+	// (that refusal lives in resolveGranted). This closes the former
+	// known-forgeable ?sig=… placeholder: the URL is now a real HMAC capability
+	// the /v1/download handler verifies.
 	if intent == plate.Original {
-		res, rerr := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
-		if rerr != nil {
-			writeError(w, http.StatusInternalServerError, "unroutable", "no delivery route for this media kind")
+		if s.signer == nil {
+			writeError(w, http.StatusServiceUnavailable, "unconfigured", "original download requires PLATE_DELIVERY_SIGNING_KEY")
 			return
 		}
-		writeJSON(w, http.StatusOK, res)
+		exp := time.Now().Add(s.grantURLTTL)
+		// intent=original travels in the URL; NO grant param (an original is never
+		// granted). handleDownload verifies against the owner sentinel.
+		base := s.urls.DownloadBase + "/v1/download/" + asset.Vault.Key +
+			"?intent=" + url.QueryEscape(string(plate.Original))
+		writeJSON(w, http.StatusOK, plate.DeliveryResolution{
+			Intent: plate.Original,
+			Delivery: &plate.Delivery{
+				Url:     s.signer.sign(base, string(plate.Original), ownerOriginalSentinel, exp),
+				Mode:    plate.Signed,
+				Expires: &exp,
+			},
+		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, s.resolveNonOriginal(intent, asset))
+}
+
+// resolveGranted serves granted-mode delivery (spec Q3.B). The grant is the
+// capability: it is resolved by id (carrying its own account), checked live
+// (not revoked, not expired, covers this asset) through the short-TTL cache,
+// and — if live — turned into a SIGNED, short-expiry URL wrapped as mode:granted.
+//
+// Refusal is the leak-safe honest refusal (§4.3): a not-found, not-covered,
+// revoked, or expired grant all collapse to delivery:null + reason:unauthorized
+// (HTTP 200), so a recipient cannot distinguish "no such grant" from "revoked"
+// from "not in this set" — the contract's stated meaning of `unauthorized`.
+func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID, assetID string, intent plate.Intent) {
+	unauthorized := func() {
+		reason := plate.ReasonCodeUnauthorized
+		writeJSON(w, http.StatusOK, plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason})
+	}
+
+	// original is not a granted-delivery intent: it is the owner's authenticated
+	// escape hatch, never handed to a share-link recipient. A grant signature must
+	// NEVER mint an `original` (raw-bytes) download — this refusal is the boundary,
+	// pinned at the grant ENTRY check so it cannot erode into the shared /download
+	// tail. (Test: a valid granted sig with intent=original is refused.)
+	if intent == plate.Original {
+		unauthorized()
+		return
+	}
+
+	verdict, err := s.grants.resolve(r.Context(), s.store, grantID, assetID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "could not resolve grant")
+		return
+	}
+	if !verdict.Live() {
+		unauthorized()
+		return
+	}
+
+	// The grant is live and covers this asset. Resolve the asset under the
+	// GRANT's account (never the request's) — a grant only ever covers its own
+	// account's assets (CreateGrant enforced that at issue), so this both builds
+	// the right key space and re-confirms the asset still exists.
+	asset, err := s.store.GetAsset(r.Context(), verdict.Account, assetID)
+	if err != nil {
+		// The asset was deleted after the grant was issued (or any read error):
+		// nothing to deliver. Treat as the honest refusal, not a 500 leak.
+		unauthorized()
+		return
+	}
+
+	res := s.resolveNonOriginal(intent, asset)
+	// A pending/failed/unroutable underlying rendition carries its own reason
+	// (pending, exceeded_*, unsupported_format) — pass it through unchanged; the
+	// grant is fine, the rendition simply is not ready. Only a resolvable URL gets
+	// wrapped as granted + enforced.
+	if res.Delivery == nil {
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	signed, ok := s.enforceGranted(res.Delivery, asset, grantID, intent)
+	if !ok {
+		// No enforcement mechanism configured for this kind (no imgproxy signer for
+		// an image, or no download signer for A/V): refuse rather than ship an
+		// unenforced "granted" URL (fail closed — the whole point of the mode).
+		writeError(w, http.StatusServiceUnavailable, "unconfigured", "granted-mode delivery is not configured for this media kind (need imgproxy signing keys for images, PLATE_DELIVERY_SIGNING_KEY for A/V)")
+		return
+	}
+	res.Delivery = signed
+	writeJSON(w, http.StatusOK, res)
+}
+
+// enforceGranted turns a resolved (public) delivery into an ENFORCED granted
+// delivery, by media kind (spec Q3.B guidance):
+//   - images → an imgproxy-SIGNED URL with `exp`; imgproxy rejects expired/
+//     tampered requests at the byte edge (Plate never touches image bytes, Q5).
+//     Enforcement is expiry+tamper only — imgproxy has no grant concept, so a
+//     revoked granted image stays loadable until expiry (the capped asymmetry).
+//   - A/V → a Plate /v1/download URL, HMAC-signed over the rendition key+intent+
+//     grant+exp. When the recipient fetches it, handleDownload re-checks grant
+//     LIVENESS (so revocation kills issued A/V URLs within one cache window) and
+//     302-redirects to a short-lived R2 presigned GET.
+//
+// Returns ok=false when the required signer for this kind is absent (fail closed).
+func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID string, intent plate.Intent) (*plate.Delivery, bool) {
+	exp := time.Now().Add(s.grantURLTTL)
+	d.Mode = plate.Granted
+	d.Expires = &exp
+
+	switch asset.Kind {
+	case plate.Image, plate.Document:
+		if s.imgsigner == nil {
+			return nil, false
+		}
+		// Rebuild as an imgproxy-signed URL (the base d.Url was the unsigned
+		// preset path). The preset is the intent; the source is the vault key.
+		d.Url = s.imgsigner.signedImageURL(s.urls.ImageCDNBase, string(intent), asset.Vault.Key, exp)
+		return d, true
+	default: // video/audio → the /download redirect, verified + liveness-checked
+		if s.signer == nil {
+			return nil, false
+		}
+		rendKey := id.RenditionKey(asset.Vault.Key, string(intent))
+		// intent + grant travel IN the URL so the recipient's fetch carries them to
+		// handleDownload; the signature covers the path (which binds them too), so
+		// they cannot be swapped without breaking the signature.
+		base := s.urls.DownloadBase + "/v1/download/" + rendKey +
+			"?intent=" + url.QueryEscape(string(intent)) + "&grant=" + url.QueryEscape(grantID)
+		d.Url = s.signer.sign(base, string(intent), grantID, exp)
+		return d, true
+	}
+}
+
+// handleDownload is the signature-enforcing byte-edge for A/V (granted mode) and
+// for the owner's `original` escape hatch. It is mounted OUTSIDE the token
+// middleware: the HMAC signature IS the authorization (the URL is a bearer
+// capability). It verifies the signature, then:
+//   - for `original`: nothing more — a valid owner-sentinel signature is the
+//     owner's own short-lived capability (they were token-authenticated when it
+//     was issued).
+//   - for a granted A/V intent: RE-CHECKS grant liveness through the cache, so a
+//     revoked/expired grant stops an ALREADY-ISSUED URL from resolving within one
+//     cache window (spec Q3.B guarantee ii).
+// On success it mints a short (30–60s) R2 presigned GET and 302-redirects, with
+// Cache-Control: private, no-store so no CDN hands one presigned URL to many
+// viewers. Plate sees a tiny request; R2 serves the bytes (Q5).
+//
+// Every failure is a flat 403 with no body detail — this edge is reached by
+// recipients, and a "revoked" vs "expired" vs "bad signature" distinction here
+// would leak grant state.
+func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
+	deny := func() { http.Error(w, "forbidden", http.StatusForbidden) }
+
+	if s.signer == nil || s.storage == nil {
+		// No signer means no URL we issued can be valid here; no storage means we
+		// cannot presign. Either way there is nothing legitimate to serve.
+		deny()
+		return
+	}
+
+	key := r.PathValue("key")
+	q := r.URL.Query()
+	intent := q.Get("intent")
+	grantID := q.Get("grant")
+	if key == "" || intent == "" {
+		deny()
+		return
+	}
+
+	// Reconstruct the exact URL string that was signed and verify it. Using the
+	// configured DownloadBase (not the request's host) means the signature is
+	// checked against what Plate minted, independent of how the request arrived.
+	signedURL := s.urls.DownloadBase + "/v1/download/" + key + "?" + r.URL.RawQuery
+
+	if intent == string(plate.Original) {
+		// Owner front door: verified against the owner sentinel, never a grant. A
+		// grant-signed URL therefore cannot pull an original (its grantID won't be
+		// the sentinel), and this cannot pull a rendition it was not signed for.
+		if grantID != "" || !s.signer.verify(signedURL, intent, ownerOriginalSentinel) {
+			deny()
+			return
+		}
+	} else {
+		// Granted A/V: signature must verify AND the grant must still be live NOW.
+		if grantID == "" || !s.signer.verify(signedURL, intent, grantID) {
+			deny()
+			return
+		}
+		// The signed key is {account}/{asset-id}/{intent}; the asset id is the
+		// middle segment. Re-check liveness against that asset (revocation kills
+		// issued URLs, spec Q3.B/ii).
+		assetID := assetIDFromRenditionKey(key)
+		if assetID == "" {
+			deny()
+			return
+		}
+		verdict, err := s.grants.resolve(r.Context(), s.store, grantID, assetID)
+		if err != nil || !verdict.Live() {
+			deny()
+			return
+		}
+	}
+
+	// Mint a SHORT presigned GET — long enough to survive the redirect hop, not
+	// the whole transfer (R2 checks expiry at transfer start, so an in-flight
+	// download completes). A leaked presigned URL's window is therefore tiny.
+	target, err := s.storage.PresignGet(r.Context(), key, 45*time.Second)
+	if err != nil {
+		deny()
+		return
+	}
+	// private, no-store: the 302 names a one-time presigned URL; a CDN must never
+	// cache it and hand the same URL to another viewer.
+	w.Header().Set("Cache-Control", "private, no-store")
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// assetIDFromRenditionKey extracts the asset id (the middle segment) from a
+// rendition key `{account}/{asset-id}/{intent}`. Returns "" if the shape is
+// wrong. Used by the download edge to re-check grant liveness against the asset.
+func assetIDFromRenditionKey(key string) string {
+	parts := strings.Split(key, "/")
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[1]
 }
 
 // resolveNonOriginal resolves a non-original intent against the asset's real

@@ -63,6 +63,18 @@ type Store interface {
 	// partial grant, and no leak of which asset was foreign).
 	CreateGrant(ctx context.Context, account string, req plate.GrantRequest) (plate.Grant, error)
 
+	// ResolveGrantForDelivery looks a grant up BY GRANT ID ALONE — deliberately
+	// NOT account-scoped — because a grant IS the capability: it carries its own
+	// account, and granted delivery is the share-link case where the resolving
+	// caller need not be the grant's owner (spec Q3.B). It reports whether the
+	// grant exists, is live (not revoked AND not expired), and covers assetID.
+	// The grant's own account is returned so the caller can build the delivery
+	// URL against the right key space; it is never taken from the request. This
+	// is the one intentional exception to "every method takes account first", and
+	// it grants no cross-account read: it returns only a verdict + the grant's
+	// account, and the handler still resolves the asset under THAT account.
+	ResolveGrantForDelivery(ctx context.Context, grantID, assetID string) (GrantVerdict, error)
+
 	// AssetOwnedBy reports whether assetID exists and belongs to account. Used by
 	// endpoints that key off an asset id in the path (delivery, requestRendition,
 	// finalizeUpload) before doing their work.
@@ -95,6 +107,27 @@ type Store interface {
 	// Idempotent per (asset, intent). Account-scoped; the caller confirms
 	// ownership before enqueue.
 	EnqueueJob(ctx context.Context, account, assetID string, intent plate.Intent) (plate.Job, error)
+}
+
+// GrantVerdict is the outcome of resolving a grant for delivery. It exists to
+// keep the reasons DISTINCT so the handler can answer honestly: an absent grant
+// or one that does not cover the asset is a leak-safe not-found (a recipient
+// must not be able to probe which grant ids or assets exist); a revoked or
+// expired grant is a definite refusal with its own reason. Account is set only
+// when the grant exists (regardless of liveness) — the delivery URL is built
+// against it.
+type GrantVerdict struct {
+	Found   bool   // a grant with this id exists
+	Covers  bool   // the grant's frozen set includes assetID
+	Revoked bool   // revoked_at is set
+	Expired bool   // expires <= now
+	Account string // the grant's own account (empty if !Found)
+}
+
+// Live reports whether the grant may serve delivery right now: it must exist,
+// cover the asset, and be neither revoked nor expired.
+func (v GrantVerdict) Live() bool {
+	return v.Found && v.Covers && !v.Revoked && !v.Expired
 }
 
 // Upload is a brokered upload record (spec §5.1). The account is derived from the

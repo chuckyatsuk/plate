@@ -81,13 +81,18 @@ func serve(log *slog.Logger) error {
 	}
 
 	svc := service.New(service.Config{
-		Store:          st,
-		Verifier:       cfg.Verifier,
-		URLs:           cfg.URLs,
-		Storage:        sc.Storage,
-		Prober:         sc.Prober,
-		UploadTTL:      sc.UploadTTL,
-		UploadMaxBytes: sc.UploadMaxBytes,
+		Store:              st,
+		Verifier:           cfg.Verifier,
+		URLs:               cfg.URLs,
+		Storage:            sc.Storage,
+		Prober:             sc.Prober,
+		UploadTTL:          sc.UploadTTL,
+		UploadMaxBytes:     sc.UploadMaxBytes,
+		DeliverySigningKey: cfg.DeliverySigningKey,
+		ImgproxyKey:        cfg.ImgproxyKey,
+		ImgproxySalt:       cfg.ImgproxySalt,
+		GrantURLTTL:        cfg.GrantURLTTL,
+		GrantCacheTTL:      cfg.GrantCacheTTL,
 	})
 
 	srv := &http.Server{

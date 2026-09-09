@@ -83,19 +83,14 @@ func (b URLBuilder) Resolve(intent plate.Intent, kind plate.MediaKind, vaultKey 
 		return plate.DeliveryResolution{}, err
 	}
 
+	// `original` is intentionally NOT handled here. It is the owner's
+	// authenticated escape hatch and is now minted as a real HMAC-signed
+	// /v1/download URL in the service handler (handleResolveDeliveryURL), which
+	// holds the signer; URLBuilder only builds unsigned public-shape URLs. Calling
+	// Resolve with original is a programming error — guard it so a stray caller
+	// fails loud instead of silently producing an unsigned raw-bytes path.
 	if intent == plate.Original {
-		// The named escape hatch: an authenticated, expiring download URL that is
-		// NOT the raw CDN/storage path. It embeds the vault key only behind the
-		// authenticated download endpoint, never on a public CDN path.
-		exp := expiresSoon()
-		return plate.DeliveryResolution{
-			Intent: plate.Original,
-			Delivery: &plate.Delivery{
-				Url:     b.DownloadBase + "/v1/download/" + vaultKey + "?sig=…",
-				Mode:    plate.Signed,
-				Expires: &exp,
-			},
-		}, nil
+		return plate.DeliveryResolution{}, fmt.Errorf("service: URLBuilder.Resolve must not be called with intent=original — it is signed in the handler")
 	}
 
 	// A non-original intent resolves to a bounded rendition URL on the host the

@@ -17,6 +17,15 @@ func (s *Service) Router() http.Handler {
 	mux.HandleFunc("GET /v1/healthz", s.handleHealth)
 	mux.HandleFunc("GET /v1/readyz", s.handleReady)
 
+	// The signature-enforcing byte edge (spec Q3.B). Mounted OUTSIDE the token
+	// middleware ON PURPOSE: the HMAC signature in the URL IS the authorization,
+	// so a share-link recipient (who holds no token) can fetch a granted A/V URL,
+	// and the owner's `original` URL is likewise self-authorizing. This more
+	// specific pattern takes precedence over the "/v1/" catch-all below, so it
+	// never passes through the verifier. handleDownload verifies the signature
+	// (and, for granted, re-checks grant liveness) before redirecting to R2.
+	mux.HandleFunc("GET /v1/download/{key...}", s.handleDownload)
+
 	// Account-scoped API, all behind the token verifier. Each handler reads the
 	// account from auth.FromContext, never from the request.
 	api := http.NewServeMux()

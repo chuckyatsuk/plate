@@ -69,8 +69,20 @@ func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 			// detail URL is genuinely fetchable and the "real bytes" assertion means
 			// something. {endpoint}/{bucket} + /{renditionKey} = the object URL.
 			R2PublicBase: m.Endpoint + "/" + m.Bucket,
+			// DownloadBase is where granted-A/V and original URLs point. The e2e
+			// drives the /v1/download handler directly (path+query), so the host
+			// only needs to be a stable string the signature is computed against.
 			DownloadBase: "https://plate.example",
 		},
+		// Granted A/V needs the download signing key; imgproxy key/salt make granted
+		// IMAGE URLs signable (hex for "imgkey"/"imgsalt"). A short grant-cache TTL
+		// keeps the "revocation is effective within one window" test fast; a short
+		// granted-URL TTL keeps it under the image hard cap.
+		DeliverySigningKey: "test-delivery-signing-key",
+		ImgproxyKey:        "696d676b6579",
+		ImgproxySalt:       "696d6773616c74",
+		GrantURLTTL:        30 * time.Second,
+		GrantCacheTTL:      50 * time.Millisecond,
 	})
 	w := worker.New(worker.Config{
 		Store:              st,
