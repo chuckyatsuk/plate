@@ -72,22 +72,43 @@ func envOr(k, def string) string {
 }
 
 // LoadStorage builds the write-path dependencies (storage + prober + upload
-// bounds) from the environment, or returns a zero StorageConfig with Storage=nil
-// when R2 is not configured — a read-path-only deployment boots fine and the
-// write endpoints answer 501 (the handlers guard on nil). This keeps the write
-// path OPT-IN by config rather than a hard boot requirement.
+// bounds) from the environment. Two legitimate states, and one misconfiguration
+// that FAILS FAST (review ruling 7 — a broken deployment must die at boot with
+// instructions, not accept traffic and error per request):
+//
+//   - NONE of the R2_* vars set → read-path-only deployment (intentional). Returns
+//     Storage=nil; write endpoints answer 503 "storage not configured".
+//   - the required R2 vars set → write path enabled.
+//   - SOME but not all required R2 vars set → a misconfiguration; return an error
+//     so `serve`/`work` refuse to start rather than half-work.
 func LoadStorage(ctx context.Context) (StorageConfig, error) {
 	bucket := os.Getenv("R2_DEFAULT_BUCKET")
 	endpoint := os.Getenv("R2_ENDPOINT")
-	if bucket == "" || endpoint == "" {
-		// No storage configured: read-path-only. Not an error.
-		return StorageConfig{}, nil
+	access := os.Getenv("R2_ACCESS_KEY_ID")
+	secret := os.Getenv("R2_SECRET_ACCESS_KEY")
+
+	set := 0
+	for _, v := range []string{bucket, endpoint, access, secret} {
+		if v != "" {
+			set++
+		}
 	}
+	switch set {
+	case 0:
+		// Nothing configured: read-path-only. Not an error.
+		return StorageConfig{}, nil
+	case 4:
+		// Fully configured: proceed.
+	default:
+		return StorageConfig{}, fmt.Errorf(
+			"service: storage is partially configured (%d/4 of R2_DEFAULT_BUCKET, R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY set) — set all four to enable the write path, or none for a read-path-only deployment", set)
+	}
+
 	stor, err := storage.New(ctx, storage.Config{
 		Endpoint:     endpoint,
 		Region:       os.Getenv("R2_REGION"),
-		AccessKey:    os.Getenv("R2_ACCESS_KEY_ID"),
-		SecretKey:    os.Getenv("R2_SECRET_ACCESS_KEY"),
+		AccessKey:    access,
+		SecretKey:    secret,
 		Bucket:       bucket,
 		UsePathStyle: os.Getenv("PLATE_S3_PATH_STYLE") == "true",
 	})
@@ -118,6 +139,13 @@ func parseDurationOr(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// DetailMaxDurationSeconds is the detail-tier duration ceiling in seconds from
+// PLATE_DETAIL_MAX_DURATION (a Go duration like "720s"), default 720 (12 min,
+// spec §5.4). Read here so the worker and any delivery-side check share one source.
+func DetailMaxDurationSeconds() float64 {
+	return parseDurationOr("PLATE_DETAIL_MAX_DURATION", 720*time.Second).Seconds()
 }
 
 func parseInt64Or(key string, def int64) int64 {

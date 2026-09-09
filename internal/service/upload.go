@@ -3,13 +3,12 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/chuckyatsuk/plate/internal/id"
 	plate "github.com/chuckyatsuk/plate/internal/plate"
+	"github.com/chuckyatsuk/plate/internal/probe"
 	"github.com/chuckyatsuk/plate/internal/storage"
 	"github.com/chuckyatsuk/plate/internal/store"
 )
@@ -30,7 +29,7 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.storage == nil {
-		writeError(w, http.StatusNotImplemented, "not_implemented", "this deployment has no storage backend configured")
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "storage backend not configured")
 		return
 	}
 	acct := account(r) // the ONLY source of the account — the token claim.
@@ -96,13 +95,28 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// imageProbePrefixBytes is how much of an object's head the image probe reads via
+// a ranged GET — enough for JPEG/PNG/GIF headers, so a 300MB TIFF is never fully
+// downloaded into the request (review ruling 1).
+const imageProbePrefixBytes = 64 * 1024
+
 // handleFinalizeUpload registers the vault object after a successful PUT (spec
-// §5.1, §5.3): it HEADs the stored object (confirm it landed, read true size),
-// PROBES it (ffprobe/stdlib) to record true dimensions/duration/codec/container,
-// and creates the asset — all account-scoped. Fail closed: an object that is
-// absent or unprobeable is refused (the asset is not created); a ceiling breach
-// still creates the asset but the offending intent will refuse at delivery (spec
-// §5.3 — refusal is about DELIVERY, not STORAGE).
+// §5.1, §5.3 refined per review ruling 1). Fail-closed means the vault never
+// accepts an object it cannot ACCOUNT FOR — existence + identity, confirmed here
+// synchronously — NOT that every delivery property is known synchronously.
+// Probing for delivery properties lives where the media runtime is:
+//
+//   - IMAGES: probed here, header-only via a ranged GET (stdlib, no ffprobe) →
+//     asset created probe_status=ready.
+//   - A/V: NOT probed here (the API has no ffprobe, and pulling a multi-GB master
+//     into a sub-100ms request is the exact failure §5.1's broker avoids). The
+//     asset is created probe_status=pending and a transcode job is enqueued; the
+//     worker probes as its first step and backfills the metadata.
+//   - DOCUMENTS: no probe needed → probe_status=ready.
+//
+// Checksum (review ruling 2): the client's claim is NEVER stored as verified. We
+// verify against the object's ETag when it is a simple (single-part) MD5; else we
+// leave it unverified and let the worker confirm it while it streams the bytes.
 //
 // The account-isolation boundary: finalize recovers the pending upload
 // account-scoped, so a B-owned upload id is not finalizable by A (leak-safe 404).
@@ -110,8 +124,10 @@ func (s *Service) handleFinalizeUpload(w http.ResponseWriter, r *http.Request) {
 	if !scopeCheck(w, r, "assets:write") {
 		return
 	}
-	if s.storage == nil || s.prober == nil {
-		writeError(w, http.StatusNotImplemented, "not_implemented", "this deployment cannot finalize uploads")
+	// Storage is required to finalize; its absence is a deployment misconfig caught
+	// at startup (see LoadStorage/validateForWrite), not a per-request feature gap.
+	if s.storage == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "storage backend not configured")
 		return
 	}
 	acct := account(r)
@@ -137,106 +153,111 @@ func (s *Service) handleFinalizeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !info.Exists {
-		// The PUT never completed — nothing to finalize. 409 per the contract
-		// (the uploaded object failed verification).
+		// The PUT never completed — nothing to finalize. 409 per the contract.
 		writeError(w, http.StatusConflict, "not_uploaded", "no uploaded object found for this upload")
 		return
 	}
 
-	// Probe the object for its true properties (spec §5.3). Route by declared
-	// content type: images use the stdlib prober (no cgo), A/V uses ffprobe. Fail
-	// closed — an unprobeable object is not promoted.
-	vr, err := s.probeObject(r.Context(), up, info)
-	if err != nil {
-		writeError(w, http.StatusConflict, "unprobeable", "uploaded object could not be verified")
-		return
+	kind := kindFromContentType(up.ContentType)
+
+	vr := store.VaultRecord{Kind: kind, SizeBytes: info.Size}
+
+	// Checksum: verify against the ETag when it is a simple MD5 (single-part PUT).
+	// Never store the raw client claim as verified (review ruling 2).
+	if verified, ok := verifyChecksumFromETag(req.Checksum, info.ETag); ok {
+		vr.Checksum = verified
+		vr.ChecksumVerified = true
 	}
-	vr.Checksum = req.Checksum
-	vr.SizeBytes = info.Size
+	// else: leave Checksum empty + ChecksumVerified false; the worker confirms it
+	// while streaming (A/V), or a later pass does for images. The field never holds
+	// an unverified value.
+
+	switch kind {
+	case plate.Image:
+		// Header-only probe via ranged GET — no full download.
+		pr, perr := s.probeImageHead(r.Context(), up.Key)
+		if perr != nil {
+			// Fail closed: an image we cannot read is not promoted.
+			writeError(w, http.StatusConflict, "unprobeable", "uploaded image could not be verified")
+			return
+		}
+		vr.Width, vr.Height = ptrI32(pr.Width), ptrI32(pr.Height)
+		if pr.Container != "" {
+			c := pr.Container
+			vr.Container = &c
+		}
+		vr.ProbeStatus = "ready"
+
+	case plate.Document:
+		// No media metadata to probe; existence is enough.
+		vr.ProbeStatus = "ready"
+
+	default: // video / audio — defer probing to the worker.
+		vr.ProbeStatus = "pending"
+	}
 
 	asset, err := s.store.FinalizeUpload(r.Context(), acct, uploadID, vr)
 	if mapStoreErr(w, err) {
 		return
 	}
+
+	// A/V: enqueue the worker to probe + transcode. Enqueue the detail intent as
+	// the default derivation; other intents are requested explicitly later.
+	if kind == plate.Video || kind == plate.Audio {
+		if _, err := s.store.EnqueueJob(r.Context(), acct, uploadID, plate.Detail); err != nil {
+			// The asset exists; a failed enqueue is recoverable (re-request the
+			// rendition). Do not fail the finalize.
+			writeError(w, http.StatusInternalServerError, "internal", "asset created but enqueue failed")
+			return
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, asset)
 }
 
-// probeObject downloads the object and probes it. For images it uses the stdlib
-// (decode config); for A/V it writes a temp file and runs ffprobe. Returns the
-// VaultRecord fields the probe can determine (checksum/size are filled by the
-// caller from the HEAD + the client checksum).
-func (s *Service) probeObject(ctx context.Context, up store.Upload, info storage.ObjectInfo) (store.VaultRecord, error) {
-	kind := kindFromContentType(up.ContentType)
-
-	body, err := s.storage.Get(ctx, up.Key)
+// probeImageHead reads just the header of an image via a ranged GET and returns
+// its dimensions — the API's image probe that never downloads the whole object.
+func (s *Service) probeImageHead(ctx context.Context, key string) (probe.Result, error) {
+	body, err := s.storage.GetRange(ctx, key, 0, imageProbePrefixBytes)
 	if err != nil {
-		return store.VaultRecord{}, err
+		return probe.Result{}, err
 	}
 	defer body.Close()
-
-	// Spool to a temp file — both the image decoder and ffprobe want a file/seeker,
-	// and the worker's scratch dir is the right home for this in production.
-	tmp, err := os.CreateTemp("", "plate-finalize-*")
-	if err != nil {
-		return store.VaultRecord{}, err
+	// Image probing is pure stdlib (no ffprobe), so a prober built without an
+	// ffprobe path works even on the probe-less API image.
+	pr := s.prober
+	if pr == nil {
+		pr = probe.New("")
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
-	if _, err := io.Copy(tmp, body); err != nil {
-		return store.VaultRecord{}, err
-	}
-
-	var res probeResult
-	switch kind {
-	case plate.Image:
-		pr, perr := s.prober.ProbeImage(tmp.Name())
-		if perr != nil {
-			return store.VaultRecord{}, perr
-		}
-		res = probeResult{kind: pr.Kind, w: pr.Width, h: pr.Height, container: pr.Container}
-	default: // video/audio/document → probe as A/V (documents carry no probe metadata; ffprobe tolerates)
-		pr, perr := s.prober.ProbeAV(ctx, tmp.Name())
-		if perr != nil {
-			// A document (e.g. PDF) is not probeable by ffprobe; that is not a
-			// verification failure — record it as a document with no media metadata.
-			if kind == plate.Document {
-				return store.VaultRecord{Kind: plate.Document}, nil
-			}
-			return store.VaultRecord{}, perr
-		}
-		res = probeResult{kind: pr.Kind, w: pr.Width, h: pr.Height, dur: pr.DurationS, codec: pr.Codec, container: pr.Container}
-	}
-
-	vr := store.VaultRecord{Kind: res.kind}
-	if res.w > 0 {
-		w := int32(res.w)
-		vr.Width = &w
-	}
-	if res.h > 0 {
-		h := int32(res.h)
-		vr.Height = &h
-	}
-	if res.dur > 0 {
-		d := res.dur
-		vr.DurationS = &d
-	}
-	if res.codec != "" {
-		c := res.codec
-		vr.Codec = &c
-	}
-	if res.container != "" {
-		ct := res.container
-		vr.Container = &ct
-	}
-	return vr, nil
+	return pr.ProbeImageReader(body)
 }
 
-type probeResult struct {
-	kind      plate.MediaKind
-	w, h      int
-	dur       float64
-	codec     string
-	container string
+func ptrI32(n int) *int32 {
+	if n <= 0 {
+		return nil
+	}
+	v := int32(n)
+	return &v
+}
+
+// verifyChecksumFromETag compares a client-declared sha256:… claim... actually the
+// ETag is an MD5 for single-part PUTs, which is a DIFFERENT digest than sha256, so
+// it cannot confirm a sha256 claim. What it CAN do: when the client declares an
+// md5:… checksum, confirm it against the ETag. A multipart ETag (contains "-") is
+// not a plain MD5 and cannot be compared. Returns (verifiedValue, true) only on a
+// real match. For sha256 claims, verification is deferred to the worker (which
+// streams the bytes anyway) — we return ok=false here rather than fake it.
+func verifyChecksumFromETag(clientClaim, etag string) (string, bool) {
+	etag = strings.Trim(etag, "\"")
+	if etag == "" || strings.Contains(etag, "-") {
+		return "", false // absent or multipart — cannot compare
+	}
+	claim := strings.TrimPrefix(clientClaim, "md5:")
+	if claim != clientClaim && strings.EqualFold(claim, etag) {
+		// Client declared md5:… and it matches the object's ETag.
+		return "md5:" + strings.ToLower(etag), true
+	}
+	return "", false
 }
 
 // kindFromContentType maps a declared MIME type to a MediaKind. The routing
