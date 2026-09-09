@@ -19,6 +19,7 @@ import (
 
 	"github.com/chuckyatsuk/plate/internal/service"
 	"github.com/chuckyatsuk/plate/internal/store"
+	"github.com/chuckyatsuk/plate/internal/worker"
 )
 
 func main() {
@@ -35,10 +36,10 @@ func main() {
 			os.Exit(1)
 		}
 	case "work":
-		// Phase 1 has no worker (spec §8). The command exists so the two-process
-		// shape is real from day one, but it refuses rather than pretending.
-		fmt.Fprintln(os.Stderr, "plate work: the worker is Phase 2 (spec §8); not implemented in the read-path build.")
-		os.Exit(2)
+		if err := work(log); err != nil {
+			log.Error("work failed", "err", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work)\n", os.Args[1])
 		os.Exit(2)
@@ -101,6 +102,56 @@ func serve(log *slog.Logger) error {
 
 	log.Info("plate serve", "addr", cfg.HTTPAddr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// work runs the transcode worker (spec §5.2, Q4). Unlike serve, storage is
+// REQUIRED — the worker's whole job is pulling originals and writing renditions.
+func work(log *slog.Logger) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg, err := service.LoadEnv()
+	if err != nil {
+		return err
+	}
+	sc, err := service.LoadStorage(ctx)
+	if err != nil {
+		return err
+	}
+	if sc.Storage == nil {
+		return fmt.Errorf("plate work: storage is required (set R2_ENDPOINT / R2_DEFAULT_BUCKET)")
+	}
+
+	st, err := store.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	w := worker.New(worker.Config{
+		Store:      st,
+		Storage:    sc.Storage,
+		Transcoder: worker.NewFFmpegTranscoder(os.Getenv("PLATE_FFMPEG_PATH"), "", 0),
+		Prober:     sc.Prober,
+		Log:        log,
+		ScratchDir: os.Getenv("PLATE_WORKER_SCRATCH_DIR"),
+	})
+
+	// Graceful SIGTERM: cancel the loop's context so an in-flight job finishes or
+	// releases its lease, then exit (K8s-ready, spec Q4).
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Info("worker: signal received, stopping")
+		cancel()
+	}()
+
+	log.Info("plate work")
+	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		return err
 	}
 	return nil
