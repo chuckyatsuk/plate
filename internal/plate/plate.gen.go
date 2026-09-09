@@ -285,7 +285,10 @@ type Delivery struct {
 	// Mode How a delivery URL is protected, chosen per asset (spec Q3.B). `public`
 	// and `signed` keep Plate out of the byte path; `granted` puts a per-request
 	// DB lookup in the hot path and is the only mode where revocation is the
-	// product.
+	// product. `granted` carries TWO revocation guarantees by media kind:
+	// granted images (imgproxy-signed) revoke within their (short, capped)
+	// expiry; granted A/V (Plate `/download` + per-fetch liveness) revoke within
+	// one grant-cache window. Both are effective within seconds, never instant.
 	Mode DeliveryMode `json:"mode"`
 
 	// Url The browser-reachable URL. For `original` this is a short-lived
@@ -299,7 +302,10 @@ type Delivery struct {
 // DeliveryMode How a delivery URL is protected, chosen per asset (spec Q3.B). `public`
 // and `signed` keep Plate out of the byte path; `granted` puts a per-request
 // DB lookup in the hot path and is the only mode where revocation is the
-// product.
+// product. `granted` carries TWO revocation guarantees by media kind:
+// granted images (imgproxy-signed) revoke within their (short, capped)
+// expiry; granted A/V (Plate `/download` + per-fetch liveness) revoke within
+// one grant-cache window. Both are effective within seconds, never instant.
 type DeliveryMode string
 
 // DeliveryResolution The result of resolving an intent. Exactly one of `delivery` or `reason`

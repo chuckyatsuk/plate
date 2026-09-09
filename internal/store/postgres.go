@@ -192,6 +192,34 @@ func (p *Postgres) CreateGrant(ctx context.Context, account string, req plate.Gr
 	return scanGrantRow(row)
 }
 
+// ResolveGrantForDelivery resolves a grant BY ID for the delivery hot path. It
+// is intentionally not account-scoped (see the interface doc): a grant carries
+// its own account and is itself the capability. One row read returns everything
+// the verdict needs — existence, whether the frozen set covers the asset,
+// revocation, expiry, and the owning account — computed in SQL so "live" is one
+// consistent snapshot (now() evaluated once) rather than a read-then-compare
+// race. A missing grant is ErrNotFound (leak-safe: the handler renders both
+// "no such grant" and "not covered" as the same not-found to the recipient).
+func (p *Postgres) ResolveGrantForDelivery(ctx context.Context, grantID, assetID string) (GrantVerdict, error) {
+	var v GrantVerdict
+	v.Found = true
+	err := p.pool.QueryRow(ctx, `
+		SELECT account,
+		       $2 = ANY(assets)          AS covers,
+		       revoked_at IS NOT NULL    AS revoked,
+		       expires <= now()          AS expired
+		FROM grants
+		WHERE id = $1`, grantID, assetID).
+		Scan(&v.Account, &v.Covers, &v.Revoked, &v.Expired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GrantVerdict{Found: false}, nil
+	}
+	if err != nil {
+		return GrantVerdict{}, err
+	}
+	return v, nil
+}
+
 func (p *Postgres) AssetOwnedBy(ctx context.Context, account, assetID string) (bool, error) {
 	var exists bool
 	err := p.pool.QueryRow(ctx, `

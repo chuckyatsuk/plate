@@ -92,6 +92,15 @@ paths:
         When no rendition can exist, the response is `200` with `delivery: null`
         and a closed-enum `reason` Files can act on (spec §4.3) — an honest
         refusal is a normal outcome, not an error.
+
+        **Granted mode revokes differently for images vs A/V — build for both.**
+        A granted **image** URL is imgproxy-signed: enforced by expiry + tamper
+        only, so a revoked grant keeps that image loadable until the URL expires
+        (capped short). A granted **A/V** URL is a Plate `/v1/download` URL that
+        re-checks grant liveness on every fetch, so revocation stops it within
+        one grant-cache window. Either way revocation is effective within
+        seconds, not instantaneous — an in-flight download completes. Don't build
+        a "link is dead the instant we revoke" UI on top.
       parameters:
         - $ref: '#/components/parameters/AssetIdPath'
         - name: intent
@@ -655,7 +664,10 @@ components:
         How a delivery URL is protected, chosen per asset (spec Q3.B). `public`
         and `signed` keep Plate out of the byte path; `granted` puts a per-request
         DB lookup in the hot path and is the only mode where revocation is the
-        product.
+        product. `granted` carries TWO revocation guarantees by media kind:
+        granted images (imgproxy-signed) revoke within their (short, capped)
+        expiry; granted A/V (Plate `/download` + per-fetch liveness) revoke within
+        one grant-cache window. Both are effective within seconds, never instant.
       enum: [public, signed, granted]
 
     MediaKind:

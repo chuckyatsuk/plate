@@ -25,6 +25,18 @@ type EnvConfig struct {
 	DatabaseURL string
 	Verifier    *auth.Verifier
 	URLs        URLBuilder
+
+	// DeliverySigningKey signs granted-mode A/V delivery (spec Q3.B). Empty on a
+	// deployment that never serves granted A/V; when empty, a granted A/V request
+	// is refused (503) rather than served unsigned.
+	DeliverySigningKey string
+	// ImgproxyKey / ImgproxySalt sign non-public image URLs (IMGPROXY_KEY/SALT).
+	ImgproxyKey  string
+	ImgproxySalt string
+	// GrantURLTTL / GrantCacheTTL tune granted delivery (spec Q3.B). Zero uses
+	// service defaults.
+	GrantURLTTL   time.Duration
+	GrantCacheTTL time.Duration
 }
 
 // LoadEnv builds an EnvConfig from environment variables (see .env.example). It
@@ -40,6 +52,22 @@ func LoadEnv() (EnvConfig, error) {
 			R2PublicBase: os.Getenv("R2_PUBLIC_BASE"),
 			DownloadBase: envOr("PLATE_DOWNLOAD_BASE", "https://plate.example"),
 		},
+		DeliverySigningKey: os.Getenv("PLATE_DELIVERY_SIGNING_KEY"),
+		ImgproxyKey:        os.Getenv("IMGPROXY_KEY"),
+		ImgproxySalt:       os.Getenv("IMGPROXY_SALT"),
+		GrantURLTTL:        parseDurationOr("PLATE_GRANTED_URL_TTL", 0),
+		GrantCacheTTL:      parseDurationOr("PLATE_GRANT_CACHE_TTL", 0),
+	}
+
+	// Fail fast on a granted-image window wider than the hard cap (spec Q3.B): a
+	// granted/signed image is enforced by imgproxy, which cannot check grant
+	// liveness, so its expiry bounds how long a revoked image stays loadable. A
+	// too-long PLATE_GRANTED_URL_TTL would silently create an un-revocable window;
+	// refuse to boot instead (same discipline as the storage-partial-config check).
+	if cfg.GrantURLTTL > GrantedImageMaxTTL {
+		return EnvConfig{}, fmt.Errorf(
+			"service: PLATE_GRANTED_URL_TTL (%s) exceeds the %s cap on granted-image expiry — a granted image is enforced by imgproxy, which cannot check revocation, so a longer window is silently un-revocable (spec Q3.B)",
+			cfg.GrantURLTTL, GrantedImageMaxTTL)
 	}
 	if cfg.DatabaseURL == "" {
 		return EnvConfig{}, errors.New("service: DATABASE_URL is required")
