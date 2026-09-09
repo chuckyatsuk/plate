@@ -1,14 +1,19 @@
 package service
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/chuckyatsuk/plate/internal/auth"
+	"github.com/chuckyatsuk/plate/internal/probe"
+	"github.com/chuckyatsuk/plate/internal/storage"
 )
 
 // EnvConfig reads the service's configuration ENTIRELY from the environment
@@ -62,6 +67,64 @@ func LoadEnv() (EnvConfig, error) {
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+// LoadStorage builds the write-path dependencies (storage + prober + upload
+// bounds) from the environment, or returns a zero StorageConfig with Storage=nil
+// when R2 is not configured — a read-path-only deployment boots fine and the
+// write endpoints answer 501 (the handlers guard on nil). This keeps the write
+// path OPT-IN by config rather than a hard boot requirement.
+func LoadStorage(ctx context.Context) (StorageConfig, error) {
+	bucket := os.Getenv("R2_DEFAULT_BUCKET")
+	endpoint := os.Getenv("R2_ENDPOINT")
+	if bucket == "" || endpoint == "" {
+		// No storage configured: read-path-only. Not an error.
+		return StorageConfig{}, nil
+	}
+	stor, err := storage.New(ctx, storage.Config{
+		Endpoint:     endpoint,
+		Region:       os.Getenv("R2_REGION"),
+		AccessKey:    os.Getenv("R2_ACCESS_KEY_ID"),
+		SecretKey:    os.Getenv("R2_SECRET_ACCESS_KEY"),
+		Bucket:       bucket,
+		UsePathStyle: os.Getenv("PLATE_S3_PATH_STYLE") == "true",
+	})
+	if err != nil {
+		return StorageConfig{}, fmt.Errorf("service: storage: %w", err)
+	}
+	return StorageConfig{
+		Storage:        stor,
+		Prober:         probe.New(os.Getenv("PLATE_FFPROBE_PATH")),
+		UploadTTL:      parseDurationOr("PLATE_UPLOAD_URL_TTL", time.Hour),
+		UploadMaxBytes: parseInt64Or("PLATE_UPLOAD_MAX_BYTES", 0),
+	}, nil
+}
+
+// StorageConfig is the write-path slice of the service config, built by
+// LoadStorage and merged into service.Config by main.
+type StorageConfig struct {
+	Storage        storage.Storage
+	Prober         *probe.Prober
+	UploadTTL      time.Duration
+	UploadMaxBytes int64
+}
+
+func parseDurationOr(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func parseInt64Or(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
 	}
 	return def
 }

@@ -65,7 +65,22 @@ func serve(log *slog.Logger) error {
 	}
 	defer st.Close()
 
-	svc := service.New(service.Config{Store: st, Verifier: cfg.Verifier, URLs: cfg.URLs})
+	// Write-path deps (storage + prober) are opt-in by config: absent R2 config
+	// means a read-path-only deployment (the write endpoints answer 501).
+	sc, err := service.LoadStorage(ctx)
+	if err != nil {
+		return err
+	}
+
+	svc := service.New(service.Config{
+		Store:          st,
+		Verifier:       cfg.Verifier,
+		URLs:           cfg.URLs,
+		Storage:        sc.Storage,
+		Prober:         sc.Prober,
+		UploadTTL:      sc.UploadTTL,
+		UploadMaxBytes: sc.UploadMaxBytes,
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
