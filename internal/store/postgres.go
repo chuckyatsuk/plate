@@ -200,6 +200,168 @@ func (p *Postgres) AssetOwnedBy(ctx context.Context, account, assetID string) (b
 	return exists, err
 }
 
+// ── write path (Phase 2) ────────────────────────────────────────────────────
+
+func (p *Postgres) CreateUpload(ctx context.Context, account string, u Upload) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO uploads (id, account, key, content_type, size_bytes, filename)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		u.ID, account, u.Key, u.ContentType, u.SizeBytes, nullStr(u.Filename))
+	if err != nil {
+		return fmt.Errorf("store: create upload: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) GetUpload(ctx context.Context, account, uploadID string) (Upload, error) {
+	var (
+		u        Upload
+		filename *string
+	)
+	err := p.pool.QueryRow(ctx, `
+		SELECT id, account, key, content_type, size_bytes, filename
+		FROM uploads
+		WHERE account = $1 AND id = $2`, account, uploadID).
+		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Upload{}, ErrNotFound
+	}
+	if err != nil {
+		return Upload{}, err
+	}
+	if filename != nil {
+		u.Filename = *filename
+	}
+	return u, nil
+}
+
+func (p *Postgres) FinalizeUpload(ctx context.Context, account, uploadID string, v VaultRecord) (plate.Asset, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return plate.Asset{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Recover the account-scoped upload; a B-owned upload id is not finalizable by
+	// A (ErrNotFound). FOR UPDATE so a concurrent finalize can't double-create.
+	var (
+		key      string
+		ctype    string
+		filename *string
+		finAt    *time.Time
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT key, content_type, filename, finalized_at
+		FROM uploads WHERE account = $1 AND id = $2 FOR UPDATE`,
+		account, uploadID).Scan(&key, &ctype, &filename, &finAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return plate.Asset{}, ErrNotFound
+	}
+	if err != nil {
+		return plate.Asset{}, err
+	}
+
+	// Idempotent: if already finalized, return the existing asset rather than
+	// creating a second (a retried finalize is not an error).
+	if finAt != nil {
+		a, gerr := p.getAssetTx(ctx, tx, account, uploadID)
+		if gerr != nil {
+			return plate.Asset{}, gerr
+		}
+		if cerr := tx.Commit(ctx); cerr != nil {
+			return plate.Asset{}, cerr
+		}
+		return a, nil
+	}
+
+	// Create the asset + vault object (the upload id becomes the asset id — Plate
+	// owns key generation, §3.3). The vault object is ALWAYS created; a ceiling
+	// breach is a DELIVERY refusal, not a storage refusal (spec §5.3).
+	_, err = tx.Exec(ctx, `
+		INSERT INTO assets (id, account, kind, filename,
+		    vault_key, vault_checksum, vault_size_bytes,
+		    vault_width, vault_height, vault_duration_s, vault_codec, vault_container)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		uploadID, account, string(v.Kind), filename,
+		key, v.Checksum, v.SizeBytes,
+		v.Width, v.Height, v.DurationS, v.Codec, v.Container)
+	if err != nil {
+		return plate.Asset{}, fmt.Errorf("store: create asset on finalize: %w", err)
+	}
+
+	if _, err = tx.Exec(ctx, `
+		UPDATE uploads SET finalized_at = now() WHERE account = $1 AND id = $2`,
+		account, uploadID); err != nil {
+		return plate.Asset{}, err
+	}
+
+	a, err := p.getAssetTx(ctx, tx, account, uploadID)
+	if err != nil {
+		return plate.Asset{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return plate.Asset{}, err
+	}
+	return a, nil
+}
+
+func (p *Postgres) ReclaimableUploads(ctx context.Context, olderThan time.Time, limit int32) ([]Upload, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, account, key, content_type, size_bytes, filename
+		FROM uploads
+		WHERE finalized_at IS NULL AND created < $1
+		ORDER BY created
+		LIMIT $2`, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Upload{}
+	for rows.Next() {
+		var (
+			u        Upload
+			filename *string
+		)
+		if err := rows.Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename); err != nil {
+			return nil, err
+		}
+		if filename != nil {
+			u.Filename = *filename
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// getAssetTx reads an account-scoped asset within a transaction (used by
+// finalize so the created asset is read in the same tx).
+func (p *Postgres) getAssetTx(ctx context.Context, tx pgx.Tx, account, assetID string) (plate.Asset, error) {
+	row := tx.QueryRow(ctx, `
+		SELECT id, account, kind, filename,
+		       vault_key, vault_checksum, vault_size_bytes,
+		       vault_width, vault_height, vault_duration_s, vault_codec, vault_container,
+		       created, deleted_at
+		FROM assets
+		WHERE account = $1 AND id = $2`, account, assetID)
+	a, err := scanAssetRow(row)
+	if err != nil {
+		return plate.Asset{}, err
+	}
+	// A freshly-finalized asset has no renditions yet.
+	a.Renditions = []plate.Rendition{}
+	return a, nil
+}
+
+func nullStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // ── scanning helpers ────────────────────────────────────────────────────────
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.

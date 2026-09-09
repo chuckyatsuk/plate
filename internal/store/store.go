@@ -14,6 +14,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 )
@@ -66,4 +67,52 @@ type Store interface {
 	// endpoints that key off an asset id in the path (delivery, requestRendition,
 	// finalizeUpload) before doing their work.
 	AssetOwnedBy(ctx context.Context, account, assetID string) (bool, error)
+
+	// ── write path (Phase 2) ────────────────────────────────────────────────
+
+	// CreateUpload records a brokered upload the caller is about to PUT (spec
+	// §5.1). Account-scoped: the row carries the caller's account (its token
+	// claim), and the key is {account}/{id} — the isolation boundary at ingest.
+	CreateUpload(ctx context.Context, account string, u Upload) error
+
+	// GetUpload returns a pending upload if it belongs to account; else ErrNotFound.
+	// finalizeUpload uses it to recover the key/type/size to verify against R2.
+	GetUpload(ctx context.Context, account, uploadID string) (Upload, error)
+
+	// FinalizeUpload creates the asset + vault object from a finalized upload and
+	// its probed metadata, and marks the upload finalized — in ONE transaction, so
+	// there is no "asset created but upload not marked" split (spec §5.3). Scoped
+	// to account. Returns the created asset.
+	FinalizeUpload(ctx context.Context, account, uploadID string, v VaultRecord) (plate.Asset, error)
+
+	// ReclaimableUploads returns uploads that were never finalized and are older
+	// than the grace window — the orphans the reconciliation sweep cleans up (spec
+	// §5.1). The sweep itself is Phase 2b (the worker); this read exists now so the
+	// requirement is HELD by a test (decision D5), not just a table.
+	ReclaimableUploads(ctx context.Context, olderThan time.Time, limit int32) ([]Upload, error)
+}
+
+// Upload is a brokered upload record (spec §5.1). The account is derived from the
+// caller's token, never a parameter.
+type Upload struct {
+	ID          string
+	Account     string
+	Key         string // {account}/{asset-id}
+	ContentType string
+	SizeBytes   int64
+	Filename    string
+}
+
+// VaultRecord is the probed truth finalize writes onto the asset's vault object
+// (spec §5.3): checksum + size from the stored object, dimensions/duration/codec/
+// container from the probe.
+type VaultRecord struct {
+	Kind      plate.MediaKind
+	Checksum  string
+	SizeBytes int64
+	Width     *int32
+	Height    *int32
+	DurationS *float64
+	Codec     *string
+	Container *string
 }
