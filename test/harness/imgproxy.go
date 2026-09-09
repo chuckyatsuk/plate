@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuckyatsuk/plate/internal/mediaspec"
 	"github.com/moby/moby/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -31,30 +32,26 @@ type Imgproxy struct {
 	fixtureRoot string
 }
 
-// Presets configured on the imgproxy container. These stand in for the delivery
-// presets the service will define per intent. `ONLY_PRESETS` is on, so imgproxy
+// Presets configured on the imgproxy container. These come from mediaspec — the
+// SAME preset definitions the service builds delivery URLs against and the
+// compose/production config serves (condition C1), so the presets these tests
+// verify are the presets production serves. `ONLY_PRESETS` is on, so imgproxy
 // REFUSES ad-hoc width/quality params in the URL — the structural property the
 // spec relies on (a caller names a purpose, never a transformation, spec §4.1).
 //
 // The width targets encode the intent's bound: lightbox is clamped to the
-// megapixel wall (~24MP → 2048-ish longest edge here) and the mobile-budget
-// preset is clamped tighter so a decoded RGBA frame fits the 24MiB mobile
-// budget (spec §4.2). The tests assert the DECODED result honours these.
+// megapixel wall (~24MP → 2048 longest edge) and the mobile-budget preset is
+// clamped tighter so a decoded RGBA frame fits the 24MiB mobile budget (spec
+// §4.2). The tests assert the DECODED result honours these.
 const (
-	PresetLightbox      = "lightbox"       // megapixel-wall clamp
-	PresetLightboxMobile = "lightbox_mobile" // decoded-memory clamp (mobile budget)
-	PresetThumbnail     = "thumbnail"
+	PresetLightbox       = mediaspec.PresetLightbox       // megapixel-wall clamp
+	PresetLightboxMobile = mediaspec.PresetLightboxMobile // decoded-memory clamp (mobile budget)
+	PresetThumbnail      = mediaspec.PresetThumbnail
 )
 
-// imgproxyPresets is the IMGPROXY_PRESETS value. resize:fit:W:0 fits within
-// width W preserving aspect. The mobile preset's width is chosen so that even a
-// square output stays under the 24MiB decoded ceiling: 2500*2500*4 ≈ 25MB is
-// over, so mobile is held well below — see decoded_memory test for the exact
-// budget arithmetic the service must satisfy.
-const imgproxyPresets = "" +
-	"lightbox=resize:fit:2048:0:0/enlarge:0," +
-	"lightbox_mobile=resize:fit:1400:0:0/enlarge:0," +
-	"thumbnail=resize:fit:400:0:0/enlarge:0"
+// imgproxyPresets is the IMGPROXY_PRESETS value, generated from mediaspec so the
+// widths cannot drift from what the service and compose file use.
+var imgproxyPresets = mediaspec.PresetDefs()
 
 // StartImgproxy launches imgproxy with presets and ONLY_PRESETS, mounting
 // fixtureRoot as its local source so tests can point at fixture files by name.
