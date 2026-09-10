@@ -71,8 +71,96 @@ func TestLightbox_DesktopBudget_LargerThanMobile(t *testing.T) {
 			mobileCfg.Width, mobileCfg.Height, mobileDecoded)
 	}
 	// And the desktop one must still fit its own (96 MiB) budget.
-	const desktopBudget = 96 * 1024 * 1024
-	if desktopDecoded > desktopBudget {
-		t.Fatalf("desktop rendition decodes to %d B, over the %d B (96 MiB) desktop budget", desktopDecoded, desktopBudget)
+	if desktopDecoded > desktopDecodedBudget {
+		t.Fatalf("desktop rendition decodes to %d B, over the %d B (96 MiB) desktop budget", desktopDecoded, desktopDecodedBudget)
+	}
+}
+
+// desktopDecodedBudget mirrors PLATE_DECODED_BUDGET_DESKTOP = 96 MiB (spec §5.4).
+const desktopDecodedBudget = 96 * 1024 * 1024 // 100663296 bytes
+
+// megapixelWallPixels mirrors PLATE_MAX_IMAGE_OUTPUT_MP=24 with the same 1MP fit-
+// rounding tolerance the megapixel-clamp test uses (spec §5.4).
+const megapixelWallPixels = 24_000_000 + 1_000_000
+
+// TestZoomLadder_EachRung_UnderDesktopBudgetAndMegapixelWall covers the Phase 3 A2
+// zoom ladder (spec §4.2). The zoom rungs are a DESKTOP deep-zoom surface for Uri's
+// 96MP artwork: each is its own closed-enum intent backed by its own imgproxy
+// preset. This guards the guarantee A2's guardrail makes — EVERY reachable rung is
+// clamped — by rendering a 96MP-class source through the REAL imgproxy engine and
+// measuring the ACTUAL decoded footprint of each rung's output.
+//
+// The assertions are the TWO HARD CEILINGS, and only those:
+//  1. decoded RGBA (width×height×4) <= the 96 MiB desktop budget, and
+//  2. output pixels <= the 24MP megapixel wall.
+//
+// The deepest rung (zoom_3) is exactly where the 292MB-decode tab-killer lived
+// before the ladder was bounded; it is held to the same two ceilings as every
+// other rung — no separate soft "well below 292MB" assertion, because the desktop
+// budget IS the binding ceiling and a soft restatement is not a test.
+func TestZoomLadder_EachRung_UnderDesktopBudgetAndMegapixelWall(t *testing.T) {
+	harness.RequireFFmpeg(t)
+	dir := t.TempDir()
+
+	// A genuine 96MP-class source (12000x8000 = 96MP), in Uri's real range. Every
+	// rung must clamp its output down from this.
+	harness.SynthImage(t, dir, "artwork96.png", 12000, 8000)
+	ip := harness.StartImgproxy(t, dir)
+
+	rungs := []struct {
+		name   string
+		preset string
+	}{
+		{"zoom_1", harness.PresetZoom1},
+		{"zoom_2", harness.PresetZoom2},
+		{"zoom_3", harness.PresetZoom3},
+	}
+	for _, rung := range rungs {
+		t.Run(rung.name, func(t *testing.T) {
+			cfg, status := ip.RenderConfig(t, rung.preset, "artwork96.png")
+			if status != 200 {
+				t.Fatalf("%s render returned HTTP %d, want 200 (a clamped rendition, never a 400)", rung.name, status)
+			}
+
+			outPixels := cfg.Width * cfg.Height
+			if outPixels > megapixelWallPixels {
+				t.Fatalf("%s output %dx%d = %dMP over the 24MP megapixel wall — the CDN would 400 this",
+					rung.name, cfg.Width, cfg.Height, outPixels/1_000_000)
+			}
+
+			decoded := decodedRGBABytes(cfg.Width, cfg.Height)
+			if decoded > desktopDecodedBudget {
+				t.Fatalf("%s rendition decodes to %d bytes (%dx%d × 4) — over the %d-byte (96 MiB) desktop budget; a desktop tab is at risk here",
+					rung.name, decoded, cfg.Width, cfg.Height, desktopDecodedBudget)
+			}
+		})
+	}
+}
+
+// TestZoomLadder_Monotonic proves the ladder actually deepens: each rung's decoded
+// footprint is strictly larger than the one below it (against a source large enough
+// that none of them clamp to the same wall). A ladder whose rungs collapse to one
+// size — the Blocker-A failure mode, a regex silently flattening the ladder — fails
+// here even though each rung would independently pass the ceiling test above.
+func TestZoomLadder_Monotonic(t *testing.T) {
+	harness.RequireFFmpeg(t)
+	dir := t.TempDir()
+
+	// 8000px wide: wider than zoom_3's 5120 fit, so each rung resizes to its own
+	// distinct width rather than all passing an undersized source through unchanged.
+	harness.SynthImage(t, dir, "wide8000.png", 8000, 6000)
+	ip := harness.StartImgproxy(t, dir)
+
+	c1, _ := ip.RenderConfig(t, harness.PresetZoom1, "wide8000.png")
+	c2, _ := ip.RenderConfig(t, harness.PresetZoom2, "wide8000.png")
+	c3, _ := ip.RenderConfig(t, harness.PresetZoom3, "wide8000.png")
+
+	d1 := decodedRGBABytes(c1.Width, c1.Height)
+	d2 := decodedRGBABytes(c2.Width, c2.Height)
+	d3 := decodedRGBABytes(c3.Width, c3.Height)
+
+	if !(d1 < d2 && d2 < d3) {
+		t.Fatalf("zoom ladder is not monotonic: zoom_1=%dx%d (%dB), zoom_2=%dx%d (%dB), zoom_3=%dx%d (%dB); the rungs must deepen, not collapse",
+			c1.Width, c1.Height, d1, c2.Width, c2.Height, d2, c3.Width, c3.Height, d3)
 	}
 }

@@ -76,6 +76,9 @@ const (
 	Original  Intent = "original"
 	Poster    Intent = "poster"
 	Thumbnail Intent = "thumbnail"
+	Zoom1     Intent = "zoom_1"
+	Zoom2     Intent = "zoom_2"
+	Zoom3     Intent = "zoom_3"
 )
 
 // Valid indicates whether the value is a known member of the Intent enum.
@@ -94,6 +97,12 @@ func (e Intent) Valid() bool {
 	case Poster:
 		return true
 	case Thumbnail:
+		return true
+	case Zoom1:
+		return true
+	case Zoom2:
+		return true
+	case Zoom3:
 		return true
 	default:
 		return false

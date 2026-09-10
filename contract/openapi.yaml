@@ -634,10 +634,24 @@ components:
         - thumbnail   # image — small, admin/grid cells
         - grid        # image — gallery tile
         - lightbox    # image — clamped by BOTH megapixel wall and decoded budget
+        - zoom_1      # image — deep-zoom rung 1 (desktop surface); see zoom note
+        - zoom_2      # image — deep-zoom rung 2 (desktop surface)
+        - zoom_3      # image — deep-zoom rung 3, the deepest (desktop surface)
         - poster      # video/audio — the still
         - loop        # video — <=30s, silent, ~640px — the grid tile
         - detail      # video/audio — <=12min, with audio, <=1080p — the lightbox
         - original    # any — the ONLY route to raw bytes, and it must be named
+      # Zoom ladder (spec §4.2, Phase 3 A2): deep zoom on Uri's 96MP artwork is a
+      # BOUNDED, NAMED ladder — three fixed rungs, each its own closed-enum member
+      # backed by its own imgproxy preset (same name) in internal/mediaspec. It is
+      # NOT a `zoom` intent with a `level` param: a level would be a caller-supplied
+      # sizing parameter, exactly what this closed enum exists to forbid. Every rung
+      # still passes the megapixel wall AND the decoded-memory budget. The rungs are
+      # a DESKTOP surface — mobile clamp behavior on a zoom intent is decided at the
+      # resolve handler (device wiring), not here.
+      # EXTENSION RULE: a future deeper rung is `zoom_4` — a new enum member + a new
+      # mediaspec preset + a new clamp test + regen. NEVER a `level` param. Adding a
+      # rung must stay a deliberate, reviewable contract diff, not a runtime argument.
 
     ReasonCode:
       type: string

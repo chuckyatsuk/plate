@@ -23,7 +23,7 @@ primary_region = "iad"  # near the API + Supabase; imgproxy fetches originals ov
   # Presets: the intent→resize definitions. MUST equal `plate imgproxy-presets`
   # (mediaspec.PresetDefs — the single source the image-clamp tests verify). If
   # mediaspec changes, regenerate this line:  go run ./cmd/plate imgproxy-presets
-  IMGPROXY_PRESETS = "lightbox=resize:fit:2048:0:0/enlarge:0,lightbox_mobile=resize:fit:1400:0:0/enlarge:0,thumbnail=resize:fit:400:0:0/enlarge:0,grid=resize:fit:800:0:0/enlarge:0"
+  IMGPROXY_PRESETS = "lightbox=resize:fit:2048:0:0/enlarge:0,lightbox_mobile=resize:fit:1400:0:0/enlarge:0,thumbnail=resize:fit:400:0:0/enlarge:0,grid=resize:fit:800:0:0/enlarge:0,zoom_1=resize:fit:3072:0:0/enlarge:0,zoom_2=resize:fit:4096:0:0/enlarge:0,zoom_3=resize:fit:5120:0:0/enlarge:0"
 
   # Origin: imgproxy fetches originals via PRIVATE S3 (R2), so a vault original is
   # NEVER publicly reachable (the wall, spec §3.1/Q5). Plate emits image sources as

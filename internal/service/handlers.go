@@ -11,6 +11,7 @@ import (
 
 	"github.com/chuckyatsuk/plate/internal/auth"
 	"github.com/chuckyatsuk/plate/internal/id"
+	"github.com/chuckyatsuk/plate/internal/mediaspec"
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 	"github.com/chuckyatsuk/plate/internal/store"
 )
@@ -88,13 +89,23 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// device supplies the decoded-memory clamp input for image intents (spec §4.2).
+	// It DEFAULTS to mobile when unspecified — fail toward the safe (tighter) budget,
+	// never the desktop one. An unknown value is a bad request rather than a silent
+	// fallback, so a typo can't quietly serve the wrong budget.
+	device, ok := parseDevice(r.URL.Query().Get("device"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "bad_request", "device must be 'mobile' or 'desktop'")
+		return
+	}
+
 	// Granted mode (spec Q3.B): a `grant` param means "serve this only if grant G
 	// still permits it." Unlike public/signed, this puts a live per-request check
 	// in the hot path — the whole point is that revocation and expiry actually
 	// stop the URL working. Handle it entirely here and return; it resolves the
 	// asset under the GRANT's account, not the caller's.
 	if grantID := r.URL.Query().Get("grant"); grantID != "" {
-		s.resolveGranted(w, r, grantID, assetID, intent)
+		s.resolveGranted(w, r, grantID, assetID, intent, device)
 		return
 	}
 
@@ -134,7 +145,25 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	writeJSON(w, http.StatusOK, s.resolveNonOriginal(intent, asset))
+	writeJSON(w, http.StatusOK, s.resolveNonOriginal(intent, device, asset))
+}
+
+// parseDevice reads the `device` query value into a DeviceClass. Empty ⇒ mobile
+// (the contract's safe default: a small viewport ALONE takes the mobile budget,
+// and failing toward the tighter budget never blows a tab). An unrecognized value
+// is rejected (ok=false) rather than silently defaulted, so a typo surfaces as a
+// 400 instead of quietly serving the wrong decoded-memory budget.
+func parseDevice(v string) (plate.DeviceClass, bool) {
+	switch v {
+	case "":
+		return plate.Mobile, true // safe default (spec §4.2)
+	case string(plate.Mobile):
+		return plate.Mobile, true
+	case string(plate.Desktop):
+		return plate.Desktop, true
+	default:
+		return "", false
+	}
 }
 
 // resolveGranted serves granted-mode delivery (spec Q3.B). The grant is the
@@ -146,7 +175,7 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 // revoked, or expired grant all collapse to delivery:null + reason:unauthorized
 // (HTTP 200), so a recipient cannot distinguish "no such grant" from "revoked"
 // from "not in this set" — the contract's stated meaning of `unauthorized`.
-func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID, assetID string, intent plate.Intent) {
+func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID, assetID string, intent plate.Intent, device plate.DeviceClass) {
 	unauthorized := func() {
 		reason := plate.ReasonCodeUnauthorized
 		writeJSON(w, http.StatusOK, plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason})
@@ -184,7 +213,7 @@ func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID
 		return
 	}
 
-	res := s.resolveNonOriginal(intent, asset)
+	res := s.resolveNonOriginal(intent, device, asset)
 	// A pending/failed/unroutable underlying rendition carries its own reason
 	// (pending, exceeded_*, unsupported_format) — pass it through unchanged; the
 	// grant is fine, the rendition simply is not ready. Only a resolvable URL gets
@@ -193,7 +222,7 @@ func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID
 		writeJSON(w, http.StatusOK, res)
 		return
 	}
-	signed, ok := s.enforceGranted(res.Delivery, asset, grantID, intent)
+	signed, ok := s.enforceGranted(res.Delivery, asset, grantID, intent, device)
 	if !ok {
 		// No enforcement mechanism configured for this kind (no imgproxy signer for
 		// an image, or no download signer for A/V): refuse rather than ship an
@@ -217,7 +246,7 @@ func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID
 //     302-redirects to a short-lived R2 presigned GET.
 //
 // Returns ok=false when the required signer for this kind is absent (fail closed).
-func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID string, intent plate.Intent) (*plate.Delivery, bool) {
+func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID string, intent plate.Intent, device plate.DeviceClass) (*plate.Delivery, bool) {
 	exp := time.Now().Add(s.grantURLTTL)
 	d.Mode = plate.Granted
 	d.Expires = &exp
@@ -229,7 +258,10 @@ func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID s
 		}
 		// Granted image: an imgproxy-signed URL WITH expiry (imgproxy enforces the
 		// exp; grant liveness can't be checked at imgproxy — the capped asymmetry).
-		u, ok := s.signedImageURL(string(intent), asset.Vault.Key, &exp)
+		// The device clamp applies here too (imagePreset): a granted MOBILE lightbox/
+		// zoom must serve the mobile-budget preset, not the desktop rung — the
+		// decoded-memory invariant holds on every path, not only public delivery.
+		u, ok := s.signedImageURL(imagePreset(intent, device), asset.Vault.Key, &exp)
 		if !ok {
 			return nil, false
 		}
@@ -382,21 +414,53 @@ func assetIDFromRenditionKey(key string) string {
 	return ""
 }
 
+// imagePreset maps an image intent + device class to the imgproxy PRESET name to
+// serve (spec §4.2 — the decoded-memory clamp, whose input is the device class).
+// The intent names a PURPOSE; the preset names the bounded transform; for most
+// intents they share a name (the service passes the intent through unchanged), but
+// the decoded-memory clamp makes the mapping device-dependent for two cases:
+//
+//   - lightbox + mobile → lightbox_mobile: the desktop lightbox (2048) decodes
+//     larger than the 24MiB mobile budget; mobile gets the tighter (1400) preset.
+//   - zoom_1/2/3 + mobile → lightbox_mobile: the zoom ladder is a DESKTOP deep-zoom
+//     surface (every rung exceeds the mobile budget by design). A phone asking for
+//     a zoom intent is DOWNGRADED to the safe mobile rendition rather than handed a
+//     budget-blowing bitmap — "clamped by the megapixel wall" guards the CDN, not
+//     the tab, so serving the desktop rung to a phone is exactly the decoded-memory
+//     failure the clamp exists to prevent. The URL is always a real, usable
+//     rendition; mobile simply never gets deep zoom (Files shows lightbox instead).
+//
+// Everything else (any intent on desktop; grid/thumbnail on mobile, already small)
+// keeps the intent's own preset name. Desktop is the default caller (device
+// defaults to mobile only when unspecified, per the contract's safe default).
+func imagePreset(intent plate.Intent, device plate.DeviceClass) string {
+	if device == plate.Mobile {
+		switch intent {
+		case plate.Lightbox, plate.Zoom1, plate.Zoom2, plate.Zoom3:
+			return mediaspec.PresetLightboxMobile
+		}
+	}
+	return string(intent)
+}
+
 // resolveNonOriginal resolves a non-original intent against the asset's real
 // rendition/probe state (review ruling 1 — delivery-side ceiling + readiness).
 //
 //   - image intents: imgproxy transforms on the fly from the vault original, so a
-//     ready image asset resolves immediately (no rendition row needed).
+//     ready image asset resolves immediately (no rendition row needed). The device
+//     class selects the decoded-memory-clamped preset (imagePreset).
 //   - A/V intents (loop/detail): require a rendition. ready → URL; failed →
 //     delivery:null + the rendition's reason (the §4.3 honest refusal, e.g.
 //     exceeded_duration_ceiling); pending/absent → delivery:null, reason:pending.
-func (s *Service) resolveNonOriginal(intent plate.Intent, asset plate.Asset) plate.DeliveryResolution {
+//     device does not affect A/V (their bounds are transcode-time, not per-device).
+func (s *Service) resolveNonOriginal(intent plate.Intent, device plate.DeviceClass, asset plate.Asset) plate.DeliveryResolution {
 	// Images resolve immediately (imgproxy transforms the vault original on the
 	// fly — no rendition row needed). PUBLIC images are still imgproxy-SIGNED (exp
 	// nil: stable + cacheable) because imgproxy checks all URLs once keyed; the
 	// signature is tamper-protection on the transform params, not access control.
+	// The device class picks the decoded-memory-clamped preset (spec §4.2).
 	if asset.Kind == plate.Image {
-		u, ok := s.signedImageURL(string(intent), asset.Vault.Key, nil)
+		u, ok := s.signedImageURL(imagePreset(intent, device), asset.Vault.Key, nil)
 		if !ok {
 			// No imgproxy signing / source configured → cannot serve an image.
 			reason := plate.ReasonCodeUnsupportedFormat
@@ -445,7 +509,8 @@ func (s *Service) resolveNonOriginal(intent plate.Intent, asset plate.Asset) pla
 
 func validIntent(i plate.Intent) bool {
 	switch i {
-	case plate.Thumbnail, plate.Grid, plate.Lightbox, plate.Poster, plate.Loop, plate.Detail, plate.Original:
+	case plate.Thumbnail, plate.Grid, plate.Lightbox, plate.Poster, plate.Loop, plate.Detail, plate.Original,
+		plate.Zoom1, plate.Zoom2, plate.Zoom3: // image deep-zoom ladder (Phase 3 A2)
 		return true
 	}
 	return false
