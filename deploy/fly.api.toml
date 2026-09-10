@@ -22,6 +22,10 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
   PLATE_ENV = "production"
   PLATE_LOG_LEVEL = "info"
   PLATE_HTTP_ADDR = ":8080"
+  # DEMO instance: it deliberately uses the throwaway smoke keypair, so it opts in
+  # past the known-throwaway-key boot guard. A REAL prod instance must NOT set this
+  # (and must use a freshly generated keypair) — see .scratch/fly-deploy-runbook.md.
+  PLATE_ALLOW_THROWAWAY_KEYS = "true"
 
 # Public HTTP service. Unlike the worker, the API serves requests — presign,
 # finalize, resolve, and the /v1/download redirect.

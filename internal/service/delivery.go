@@ -63,10 +63,27 @@ func RouteDelivery(kind plate.MediaKind) (DeliveryHost, error) {
 type URLBuilder struct {
 	// ImageCDNBase is the imgproxy delivery base, e.g. https://cdn.example.
 	ImageCDNBase string
-	// R2PublicBase is the R2 public base for pass-through bytes.
+	// ImageSourceBucket is the R2 bucket imgproxy reads originals from, as a
+	// PRIVATE S3 source: imgproxy fetches s3://{bucket}/{vaultKey} with its own R2
+	// credentials, never over the public delivery base — so the vault original is
+	// never publicly reachable (the wall, spec §3.1/Q5). Empty ⇒ image delivery
+	// cannot build a source and is refused.
+	ImageSourceBucket string
+	// R2PublicBase is the R2 public base for pass-through bytes (A/V renditions,
+	// which live under the public `delivery/` prefix).
 	R2PublicBase string
 	// DownloadBase is the authenticated download endpoint base for `original`.
 	DownloadBase string
+}
+
+// imgproxySource builds the private S3 source URL imgproxy fetches an original
+// from: `s3://{bucket}/{vaultKey}`. Requires IMGPROXY_USE_S3 on the imgproxy side
+// with R2 credentials. Returns "" if no bucket is configured.
+func (b URLBuilder) imgproxySource(vaultKey string) string {
+	if b.ImageSourceBucket == "" {
+		return ""
+	}
+	return "s3://" + b.ImageSourceBucket + "/" + vaultKey
 }
 
 // Resolve turns an intent into a DeliveryResolution for an asset of the given
@@ -97,16 +114,13 @@ func (b URLBuilder) Resolve(intent plate.Intent, kind plate.MediaKind, vaultKey 
 	// allowlist chose — never the vault original.
 	switch host {
 	case HostImageCDN:
-		// Images transform on the fly: imgproxy fetches the vault original and
-		// applies the intent's preset. The URL names the PRESET (a purpose), never
-		// ad-hoc params (spec §4.1); ONLY_PRESETS enforces that at imgproxy.
-		return plate.DeliveryResolution{
-			Intent: intent,
-			Delivery: &plate.Delivery{
-				Url:  fmt.Sprintf("%s/%s/plain/%s", b.ImageCDNBase, intent, vaultKey),
-				Mode: plate.Public,
-			},
-		}, nil
+		// Images are NOT built here anymore: every image URL is imgproxy-SIGNED
+		// (public included, because imgproxy checks all URLs once keyed) and signing
+		// lives on the Service, which holds the signer. The Service resolves images
+		// directly (resolveNonOriginal → signedImageURL) and never routes them
+		// through URLBuilder. Reaching here with an image is a programming error —
+		// fail loud rather than emit an unsigned URL.
+		return plate.DeliveryResolution{}, fmt.Errorf("service: URLBuilder.Resolve must not build image URLs — they are imgproxy-signed in the handler")
 	default: // HostR2 — A/V renditions serve the worker-written object DIRECTLY.
 		// The URL MUST point at the exact key the worker wrote (id.RenditionKey),
 		// not a fabricated path — otherwise a ready rendition 404s (the deployed-

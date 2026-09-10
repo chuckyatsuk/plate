@@ -134,12 +134,20 @@ func (s *imgproxySigner) signPath(path string) string {
 	return "/" + sig + path
 }
 
-// signedImageURL builds a full imgproxy URL for an image intent with an expiry.
-// base is IMGPROXY_BASE_URL; preset is the intent name (ONLY_PRESETS mode: the
-// preset IS the first processing segment); source is the plain vault key. The
-// `exp:` option is inside the signed path so imgproxy enforces it.
-func (s *imgproxySigner) signedImageURL(base, preset, source string, exp time.Time) string {
-	// /{preset}/exp:{unix}/plain/{source}  — signature covers all of it.
-	path := fmt.Sprintf("/%s/exp:%d/plain/%s", preset, exp.Unix(), source)
+// signedImageURL builds a full imgproxy-signed URL for an image intent. base is
+// the imgproxy host; preset is the intent name (ONLY_PRESETS: the preset IS the
+// first processing segment); source is the FULL source URL imgproxy fetches
+// (e.g. "s3://bucket/vault/acct/asset"). The signature is the leading segment, so
+// imgproxy — which checks ALL URLs once keyed — accepts it; the same signer
+// serves public (exp nil: stable, cacheable) and granted (exp set: imgproxy
+// enforces expiry) images. When set, the `exp:` option lives INSIDE the signed
+// path so it cannot be stripped.
+func (s *imgproxySigner) signedImageURL(base, preset, source string, exp *time.Time) string {
+	var path string
+	if exp != nil {
+		path = fmt.Sprintf("/%s/exp:%d/plain/%s", preset, exp.Unix(), source)
+	} else {
+		path = fmt.Sprintf("/%s/plain/%s", preset, source)
+	}
 	return strings.TrimRight(base, "/") + s.signPath(path)
 }

@@ -3,6 +3,7 @@ package plate_test
 // Small shared helpers for the end-to-end delivery tests.
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/json"
 	"io"
@@ -45,6 +46,24 @@ func signToken(t *testing.T, priv ed25519.PrivateKey, account, scopesCSV string)
 }
 
 func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+// reqWithToken builds a request carrying an ARBITRARY bearer token (unlike
+// e.req, which always uses the harness account's token) — for tests that act as a
+// different account, e.g. an unprovisioned one.
+func reqWithToken(method, path string, body []byte, token string) *http.Request {
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, r)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req
+}
+
+func newRecorder() *httptest.ResponseRecorder { return httptest.NewRecorder() }
 
 // createGrant issues a grant over the given asset ids, expiring at exp, and
 // returns the new grant id. Uses the real POST /v1/grants endpoint (the e2e

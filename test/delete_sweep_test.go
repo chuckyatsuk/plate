@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuckyatsuk/plate/internal/id"
 	"github.com/chuckyatsuk/plate/internal/worker"
 	"github.com/chuckyatsuk/plate/test/harness"
 )
@@ -25,7 +26,7 @@ func TestE2E_DeletedAsset_BytesBecomeUnreachable(t *testing.T) {
 	assetID := e.uploadAndFinalize(img, "image/png")
 
 	// The object exists in storage after finalize.
-	key := e.account + "/" + assetID
+	key := id.VaultKey(e.account, assetID)
 	if info, err := e.stor.Storage.Head(ctx, key); err != nil || !info.Exists {
 		t.Fatalf("object should exist after finalize (err=%v exists=%v)", err, info.Exists)
 	}
@@ -70,7 +71,7 @@ func TestE2E_SweepLoop_PurgesOnTicker(t *testing.T) {
 	dir := t.TempDir()
 
 	assetID := e.uploadAndFinalize(harness.SynthImage(t, dir, "doomed.png", 320, 240), "image/png")
-	key := e.account + "/" + assetID
+	key := id.VaultKey(e.account, assetID)
 	if resp := e.req("DELETE", "/v1/assets/"+assetID, nil); resp.Code != 202 {
 		t.Fatalf("deleteAsset should be 202; got %d", resp.Code)
 	}

@@ -289,6 +289,11 @@ type Delivery struct {
 	// granted images (imgproxy-signed) revoke within their (short, capped)
 	// expiry; granted A/V (Plate `/download` + per-fetch liveness) revoke within
 	// one grant-cache window. Both are effective within seconds, never instant.
+	//
+	// `public`: no grant, no expiry, stable and cacheable. An image `public` URL
+	// carries an imgproxy signature because imgproxy verifies all URLs once
+	// keyed; the signature is tamper-protection on the transform parameters, not
+	// access control.
 	Mode DeliveryMode `json:"mode"`
 
 	// Url The browser-reachable URL. For `original` this is a short-lived
@@ -306,6 +311,11 @@ type Delivery struct {
 // granted images (imgproxy-signed) revoke within their (short, capped)
 // expiry; granted A/V (Plate `/download` + per-fetch liveness) revoke within
 // one grant-cache window. Both are effective within seconds, never instant.
+//
+// `public`: no grant, no expiry, stable and cacheable. An image `public` URL
+// carries an imgproxy signature because imgproxy verifies all URLs once
+// keyed; the signature is tamper-protection on the transform parameters, not
+// access control.
 type DeliveryMode string
 
 // DeliveryResolution The result of resolving an intent. Exactly one of `delivery` or `reason`
