@@ -47,6 +47,10 @@ const (
 	PresetLightbox       = mediaspec.PresetLightbox       // megapixel-wall clamp
 	PresetLightboxMobile = mediaspec.PresetLightboxMobile // decoded-memory clamp (mobile budget)
 	PresetThumbnail      = mediaspec.PresetThumbnail
+	// Zoom ladder (Phase 3 A2): desktop deep-zoom rungs, decoded-memory clamped.
+	PresetZoom1 = mediaspec.PresetZoom1
+	PresetZoom2 = mediaspec.PresetZoom2
+	PresetZoom3 = mediaspec.PresetZoom3
 )
 
 // imgproxyPresets is the IMGPROXY_PRESETS value, generated from mediaspec so the

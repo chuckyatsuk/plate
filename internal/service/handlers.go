@@ -445,7 +445,8 @@ func (s *Service) resolveNonOriginal(intent plate.Intent, asset plate.Asset) pla
 
 func validIntent(i plate.Intent) bool {
 	switch i {
-	case plate.Thumbnail, plate.Grid, plate.Lightbox, plate.Poster, plate.Loop, plate.Detail, plate.Original:
+	case plate.Thumbnail, plate.Grid, plate.Lightbox, plate.Poster, plate.Loop, plate.Detail, plate.Original,
+		plate.Zoom1, plate.Zoom2, plate.Zoom3: // image deep-zoom ladder (Phase 3 A2)
 		return true
 	}
 	return false

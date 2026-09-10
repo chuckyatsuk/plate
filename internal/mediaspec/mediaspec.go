@@ -120,6 +120,22 @@ const (
 	PresetLightboxMobile = "lightbox_mobile"
 	PresetThumbnail      = "thumbnail"
 	PresetGrid           = "grid"
+
+	// Zoom ladder (spec §4.2, Phase 3 A2): a BOUNDED deep-zoom ladder for Uri's
+	// 96MP artwork. Three fixed rungs, each a named preset whose name IS the
+	// contract `Intent` (zoom_1|zoom_2|zoom_3) — imgproxy runs ONLY_PRESETS and the
+	// service passes the intent string straight through as the preset name, so a
+	// rung and its intent must share a name. These are a DESKTOP surface: each rung
+	// fits the 96MiB desktop decoded budget and the 24MP megapixel wall (verified by
+	// the decoded-memory test), but rungs above `lightbox` exceed the 24MiB mobile
+	// budget — mobile clamp behavior on a zoom intent is decided at the resolve
+	// handler, not here.
+	// EXTENSION RULE: a deeper rung is `PresetZoom4` (+ enum member + clamp test +
+	// regen). NEVER a `level` param — a rung is a deliberate contract diff, not a
+	// runtime argument.
+	PresetZoom1 = "zoom_1"
+	PresetZoom2 = "zoom_2"
+	PresetZoom3 = "zoom_3"
 )
 
 // PresetWidths is the fit-width each preset clamps to, in CSS px of the longest
@@ -131,6 +147,15 @@ var PresetWidths = map[string]int{
 	PresetLightboxMobile: 1400,
 	PresetThumbnail:      400,
 	PresetGrid:           800,
+	// Zoom rungs, in CSS px of the longest edge. Sized so the WIDEST decoded RGBA
+	// frame each can produce (after the megapixel wall clamps oversized sources)
+	// stays under the 96MiB desktop budget: at the 24MP wall, decoded = 24M×4 ≈
+	// 92MB < 96MiB, so any rung ≤ the wall is safe by construction; these widths
+	// give an even deep-zoom progression well within it. The decoded-memory test
+	// proves this against a real 96MP-class source through real imgproxy.
+	PresetZoom1: 3072,
+	PresetZoom2: 4096,
+	PresetZoom3: 5120,
 }
 
 // PresetDefs returns the IMGPROXY_PRESETS environment value: each preset as
@@ -139,7 +164,7 @@ var PresetWidths = map[string]int{
 // this, so the presets the tests verify are the presets production serves.
 func PresetDefs() string {
 	// Deterministic order so the string is stable (tests may compare it).
-	order := []string{PresetLightbox, PresetLightboxMobile, PresetThumbnail, PresetGrid}
+	order := []string{PresetLightbox, PresetLightboxMobile, PresetThumbnail, PresetGrid, PresetZoom1, PresetZoom2, PresetZoom3}
 	out := ""
 	for i, name := range order {
 		if i > 0 {
