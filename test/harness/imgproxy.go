@@ -47,10 +47,15 @@ const (
 	PresetLightbox       = mediaspec.PresetLightbox       // megapixel-wall clamp
 	PresetLightboxMobile = mediaspec.PresetLightboxMobile // decoded-memory clamp (mobile budget)
 	PresetThumbnail      = mediaspec.PresetThumbnail
+	PresetGrid = mediaspec.PresetGrid
 	// Zoom ladder (Phase 3 A2): desktop deep-zoom rungs, decoded-memory clamped.
-	PresetZoom1 = mediaspec.PresetZoom1
-	PresetZoom2 = mediaspec.PresetZoom2
-	PresetZoom3 = mediaspec.PresetZoom3
+	// zoom_3 is aspect-bucketed (imgproxy caps the long edge, so one cap can't hold
+	// ≤24MP across aspects) — the three buckets are selected by probed aspect.
+	PresetZoom1           = mediaspec.PresetZoom1
+	PresetZoom2           = mediaspec.PresetZoom2
+	PresetZoom3NearSquare = mediaspec.PresetZoom3NearSquare
+	PresetZoom3Standard   = mediaspec.PresetZoom3Standard
+	PresetZoom3Wide       = mediaspec.PresetZoom3Wide
 )
 
 // imgproxyPresets is the IMGPROXY_PRESETS value, generated from mediaspec so the
@@ -82,6 +87,9 @@ func StartImgproxy(t *testing.T, fixtureRoot string) *Imgproxy {
 			// oversized — the incident is "returns a clamped rendition, never a
 			// 400" (spec §7). 100MP headroom covers Uri's 96MP shots.
 			"IMGPROXY_MAX_SRC_RESOLUTION": "100",
+			// Result-edge belt (from mediaspec, single source) so the harness proves
+			// the same edge ceiling production runs — matches deploy/fly.imgproxy.toml.
+			"IMGPROXY_MAX_RESULT_DIMENSION": fmt.Sprintf("%d", mediaspec.MaxResultDimension),
 		},
 		Files: []testcontainers.ContainerFile{},
 		HostConfigModifier: func(hc *container.HostConfig) {

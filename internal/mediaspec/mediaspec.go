@@ -109,8 +109,10 @@ func RemuxCopyArgs(src, dst string) []string {
 // IMGPROXY_PRESETS value; the service builds delivery URLs that name a preset,
 // and the image-clamp tests decode the real output to check the bounds.
 //
-// resize:fit:W:0:0/enlarge:0 fits within width W preserving aspect and never
-// enlarges. The widths encode the intent bounds:
+// resize:fit:W:W:0/enlarge:0 fits within a W×W BOX preserving aspect and never
+// enlarges — so the LONGEST edge is bounded to W regardless of orientation. (NOT
+// fit:W:0, which bounds WIDTH only and lets a portrait's height run past W — the
+// area-wall bug the cross-aspect test caught.) The widths encode the intent bounds:
 //   - lightbox: clamped to the megapixel wall (~24MP → 2048 longest edge)
 //   - lightbox_mobile: clamped TIGHTER so a decoded RGBA frame fits the 24MiB
 //     mobile budget (spec §4.2) — a wide desktop lightbox would blow a phone tab
@@ -122,55 +124,149 @@ const (
 	PresetGrid           = "grid"
 
 	// Zoom ladder (spec §4.2, Phase 3 A2): a BOUNDED deep-zoom ladder for Uri's
-	// 96MP artwork. Three fixed rungs, each a named preset whose name IS the
-	// contract `Intent` (zoom_1|zoom_2|zoom_3) — imgproxy runs ONLY_PRESETS and the
-	// service passes the intent string straight through as the preset name, so a
-	// rung and its intent must share a name. These are a DESKTOP surface: each rung
-	// fits the 96MiB desktop decoded budget and the 24MP megapixel wall (verified by
-	// the decoded-memory test), but rungs above `lightbox` exceed the 24MiB mobile
-	// budget — mobile clamp behavior on a zoom intent is decided at the resolve
-	// handler, not here.
-	// EXTENSION RULE: a deeper rung is `PresetZoom4` (+ enum member + clamp test +
-	// regen). NEVER a `level` param — a rung is a deliberate contract diff, not a
-	// runtime argument.
+	// 96MP artwork. Three fixed INTENTS (zoom_1|zoom_2|zoom_3). zoom_1/zoom_2 are a
+	// single preset each (their name IS the intent). zoom_3 is a SET of three
+	// aspect-bucketed presets (see below) — the resolver selects one by the asset's
+	// probed aspect, so the intent zoom_3 fans out to a preset internally, the way
+	// device selects lightbox vs lightbox_mobile. Consumers only ever name zoom_3.
+	// These are a DESKTOP surface: rungs above lightbox exceed the 24MiB MOBILE
+	// budget by design — mobile clamp behavior on a zoom intent is decided at the
+	// resolve handler, not here.
+	// EXTENSION RULE: a deeper rung is a new intent `zoom_4` (+ enum member + clamp
+	// test + regen). NEVER a `level` param — a rung is a deliberate contract diff.
 	PresetZoom1 = "zoom_1"
 	PresetZoom2 = "zoom_2"
-	PresetZoom3 = "zoom_3"
+
+	// zoom_3 aspect buckets. The preset caps the LONGEST EDGE (resize:fit:W:W box),
+	// so ONE edge cap cannot hold the ≤24MP AREA wall across aspects (a landscape
+	// cap lets a square through at >24MP → CDN 400; a square cap dips landscape).
+	// zoom_3 is therefore three presets, each sized for the SQUAREST member of its
+	// aspect band (that member breaches the 24MP wall first). Selected by the
+	// asset's probed aspect r = max(w,h)/min(w,h) via Zoom3PresetForAspect.
+	PresetZoom3NearSquare = "zoom_3_nearsquare"
+	PresetZoom3Standard   = "zoom_3_standard"
+	PresetZoom3Wide       = "zoom_3_wide"
 )
 
-// PresetWidths is the fit-width each preset clamps to, in CSS px of the longest
-// edge. These are the numbers the decoded-pixel tests hold the output to. Chosen
-// so lightbox_mobile stays under the 24MiB decoded budget even for a square
-// output (1400²×4 ≈ 7.8MB, well under 24MiB, with headroom for 3 preloaded).
+// PresetWidths is the fit-width each preset clamps to, in CSS px of the LONGEST
+// edge (imgproxy resize:fit:W:W:0 caps the long edge via a W×W box, verified against the real
+// engine across orientations). These are the numbers the decoded-pixel tests hold
+// the output to.
+//
+// ⚠️ THE PER-EDGE CAP IS A CONVENIENCE; THE REAL GUARANTEE IS AN AREA CEILING.
+// The binding rule is OUTPUT ≤ 24MP (the CDN megapixel wall) — an AREA constraint.
+// imgproxy expresses only per-EDGE caps, so zoom_3 is a set of aspect-bucketed
+// presets whose edge caps each realize ~24MP for their band, selected by the
+// asset's probed aspect — parity with ImageKit's safeWidth area clamp
+// (sqrt(24MP × aspect), measured live: landscape 3:2 → w-5999, square → w-4898).
+//
+// zoom_3 BANDS (r = max/min; each cap = floor(sqrt(24,000,000 × r_band_min)),
+// sized for the band's SQUAREST member — boundaries fit to Uri's 339-image
+// catalogue audit, .scratch/plate-aspect-audit.md: 89% cluster in r∈[1.25,1.6),
+// median 1.499, so boundaries sit in the histogram GAPS, not through the cluster):
+//   near-square  r < 1.25        → 4898  (sized for r=1.0)
+//   standard     1.25 ≤ r < 1.6  → 5477  (sized for r=1.25)
+//   wide         r ≥ 1.6         → 6197  (sized for r=1.6; r clamped at band max)
+// ACCEPTED TRADEOFF: the standard band's 5477 cap means a 3:2 median work gets
+// ~20MP at max zoom vs the ~24MP the live ImageKit site serves — a small,
+// deliberate dip on the deepest rung of the dominant aspect, the honest cost of
+// bucketing a continuous area clamp into 3 discrete edge caps under ONLY_PRESETS.
+// Not worth a 4th band (chuck). A future band/rung MUST be sized for its squarest
+// member and stay ≤ 24MP / ≤ MaxResultDimension.
+// (zoom_1/zoom_2 need no bucketing: square 3072²=9.4MP, 4096²=16.8MP, both <24MP.)
 var PresetWidths = map[string]int{
 	PresetLightbox:       2048,
 	PresetLightboxMobile: 1400,
 	PresetThumbnail:      400,
 	PresetGrid:           800,
-	// Zoom rungs, in CSS px of the longest edge. Sized so the WIDEST decoded RGBA
-	// frame each can produce (after the megapixel wall clamps oversized sources)
-	// stays under the 96MiB desktop budget: at the 24MP wall, decoded = 24M×4 ≈
-	// 92MB < 96MiB, so any rung ≤ the wall is safe by construction; these widths
-	// give an even deep-zoom progression well within it. The decoded-memory test
-	// proves this against a real 96MP-class source through real imgproxy.
-	PresetZoom1: 3072,
-	PresetZoom2: 4096,
-	PresetZoom3: 5120,
+	PresetZoom1:          3072,
+	PresetZoom2:          4096,
+	PresetZoom3NearSquare: 4898,
+	PresetZoom3Standard:   5477,
+	PresetZoom3Wide:       6197,
+}
+
+// LosslessPresets are the presets served at imgproxy quality 100 — the deep-zoom
+// rungs, matching the live site's q-100 at max zoom (dimensions parity without
+// quality parity is a quieter regression). lightbox/grid/thumbnail/poster keep
+// imgproxy's default quality.
+var LosslessPresets = map[string]bool{
+	PresetZoom1:           true,
+	PresetZoom2:           true,
+	PresetZoom3NearSquare: true,
+	PresetZoom3Standard:   true,
+	PresetZoom3Wide:       true,
+}
+
+// zoom3 band boundaries on r = max(w,h)/min(w,h). Boundaries fit to the catalogue
+// audit (histogram gaps), not guessed. Sizing invariant: each band cap =
+// floor(sqrt(24,000,000 × r_band_min)).
+const (
+	zoom3NearSquareMaxR = 1.25 // r < 1.25 → near-square
+	zoom3StandardMaxR   = 1.6  // 1.25 ≤ r < 1.6 → standard; r ≥ 1.6 → wide
+)
+
+// Zoom3PresetForAspect selects the zoom_3 aspect-bucket preset for a source of the
+// given probed dimensions. r = max/min is orientation-independent (imgproxy caps
+// the long edge, so a 3:2 and a 2:3 clamp identically). A source with unknown/zero
+// dims falls to the near-square (smallest, safest) bucket — fail toward the
+// tightest area budget, never the largest.
+func Zoom3PresetForAspect(w, h int) string {
+	if w <= 0 || h <= 0 {
+		return PresetZoom3NearSquare
+	}
+	long, short := w, h
+	if short > long {
+		long, short = short, long
+	}
+	r := float64(long) / float64(short)
+	switch {
+	case r < zoom3NearSquareMaxR:
+		return PresetZoom3NearSquare
+	case r < zoom3StandardMaxR:
+		return PresetZoom3Standard
+	default:
+		return PresetZoom3Wide
+	}
+}
+
+// MaxResultDimension is a deployment-wide belt: imgproxy's IMGPROXY_MAX_RESULT_
+// DIMENSION caps the longest edge of ANY result, regardless of preset. It is set
+// to the LARGEST legitimate preset edge (zoom_3 wide band = 6197) so a future
+// preset misconfiguration or a forgotten cap cannot exceed the area ceiling on an
+// edge — defense in depth behind the per-preset caps above. It is an EDGE limit
+// (imgproxy has no area/megapixel result limit), so it backstops, it does not
+// replace, the aspect-bucketed per-edge cap sizing.
+const MaxResultDimension = 6197
+
+// presetOrder is the deterministic order PresetDefs emits (tests compare the
+// string; the deploy config mirrors it exactly).
+var presetOrder = []string{
+	PresetLightbox, PresetLightboxMobile, PresetThumbnail, PresetGrid,
+	PresetZoom1, PresetZoom2,
+	PresetZoom3NearSquare, PresetZoom3Standard, PresetZoom3Wide,
 }
 
 // PresetDefs returns the IMGPROXY_PRESETS environment value: each preset as
-// `name=resize:fit:W:0:0/enlarge:0`, joined by commas. Both the test harness (to
-// configure the imgproxy container) and the compose file / production config use
+// `name=resize:fit:W:W:0/enlarge:0`, plus `/quality:100` for the lossless (deep-
+// zoom) presets, joined by commas. Both the test harness and the deploy config use
 // this, so the presets the tests verify are the presets production serves.
 func PresetDefs() string {
-	// Deterministic order so the string is stable (tests may compare it).
-	order := []string{PresetLightbox, PresetLightboxMobile, PresetThumbnail, PresetGrid, PresetZoom1, PresetZoom2, PresetZoom3}
 	out := ""
-	for i, name := range order {
+	for i, name := range presetOrder {
 		if i > 0 {
 			out += ","
 		}
-		out += name + "=resize:fit:" + itoa(PresetWidths[name]) + ":0:0/enlarge:0"
+		// fit:W:W (a W×W BOX), NOT fit:W:0 (width only). The box bounds the LONGEST
+		// edge to W regardless of orientation — so a portrait's height cannot run
+		// away past the cap (fit:W:0 bounds width only, letting a tall image blow the
+		// area wall; that's the bug the cross-aspect test caught). enlarge:0 keeps a
+		// small source untouched.
+		w := itoa(PresetWidths[name])
+		out += name + "=resize:fit:" + w + ":" + w + ":0/enlarge:0"
+		if LosslessPresets[name] {
+			out += "/quality:100"
+		}
 	}
 	return out
 }

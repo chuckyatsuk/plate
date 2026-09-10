@@ -261,7 +261,7 @@ func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID s
 		// The device clamp applies here too (imagePreset): a granted MOBILE lightbox/
 		// zoom must serve the mobile-budget preset, not the desktop rung — the
 		// decoded-memory invariant holds on every path, not only public delivery.
-		u, ok := s.signedImageURL(imagePreset(intent, device), asset.Vault.Key, &exp)
+		u, ok := s.signedImageURL(imagePreset(intent, device, asset.Vault.Width, asset.Vault.Height), asset.Vault.Key, &exp)
 		if !ok {
 			return nil, false
 		}
@@ -430,17 +430,71 @@ func assetIDFromRenditionKey(key string) string {
 //     failure the clamp exists to prevent. The URL is always a real, usable
 //     rendition; mobile simply never gets deep zoom (Files shows lightbox instead).
 //
+// zoom_3 is aspect-bucketed: imgproxy caps the long edge only, so ONE cap can't
+// hold ≤24MP across aspects. The bucket is chosen from the asset's PROBED dims
+// (srcW/srcH) via mediaspec.Zoom3PresetForAspect. Unknown dims fall to the
+// near-square (smallest/safest) bucket — the same fail-safe direction as device.
+//
 // Everything else (any intent on desktop; grid/thumbnail on mobile, already small)
 // keeps the intent's own preset name. Desktop is the default caller (device
 // defaults to mobile only when unspecified, per the contract's safe default).
-func imagePreset(intent plate.Intent, device plate.DeviceClass) string {
+func imagePreset(intent plate.Intent, device plate.DeviceClass, srcW, srcH *int32) string {
 	if device == plate.Mobile {
 		switch intent {
 		case plate.Lightbox, plate.Zoom1, plate.Zoom2, plate.Zoom3:
 			return mediaspec.PresetLightboxMobile
 		}
 	}
+	if intent == plate.Zoom3 {
+		w, h := 0, 0
+		if srcW != nil {
+			w = int(*srcW)
+		}
+		if srcH != nil {
+			h = int(*srcH)
+		}
+		return mediaspec.Zoom3PresetForAspect(w, h)
+	}
 	return string(intent)
+}
+
+// fitOutputDims computes the OUTPUT dimensions an image preset produces for a
+// source of the given probed dimensions, replicating imgproxy's
+// resize:fit:W:W:0/enlarge:0: fit the LONGEST EDGE to the preset cap W, preserve
+// aspect, never enlarge. (Verified empirically against real imgproxy across
+// landscape/portrait/square sources: the long edge is bounded to W, the short
+// edge scales proportionally, and a source already under W passes through.)
+//
+// Returns ok=false when the source wasn't probed (nil/zero dims) — nothing honest
+// to report — or the preset has no known cap (an A/V or unknown preset), so the
+// caller omits width/height rather than inventing them.
+func fitOutputDims(srcW, srcH *int32, preset string) (w, h int32, ok bool) {
+	cap, capOK := mediaspec.PresetWidths[preset]
+	if !capOK || srcW == nil || srcH == nil || *srcW <= 0 || *srcH <= 0 {
+		return 0, 0, false
+	}
+	sw, sh := int(*srcW), int(*srcH)
+	long := sw
+	if sh > long {
+		long = sh
+	}
+	// enlarge:0 — a source whose longest edge is already within the cap is served
+	// unchanged.
+	if long <= cap {
+		return int32(sw), int32(sh), true
+	}
+	// Scale so the longest edge becomes cap; round the other edge to the nearest
+	// pixel (imgproxy rounds, and the ±1px is within the tests' fit tolerance).
+	scale := float64(cap) / float64(long)
+	ow := int(float64(sw)*scale + 0.5)
+	oh := int(float64(sh)*scale + 0.5)
+	if ow < 1 {
+		ow = 1
+	}
+	if oh < 1 {
+		oh = 1
+	}
+	return int32(ow), int32(oh), true
 }
 
 // resolveNonOriginal resolves a non-original intent against the asset's real
@@ -460,16 +514,24 @@ func (s *Service) resolveNonOriginal(intent plate.Intent, device plate.DeviceCla
 	// signature is tamper-protection on the transform params, not access control.
 	// The device class picks the decoded-memory-clamped preset (spec §4.2).
 	if asset.Kind == plate.Image {
-		u, ok := s.signedImageURL(imagePreset(intent, device), asset.Vault.Key, nil)
+		preset := imagePreset(intent, device, asset.Vault.Width, asset.Vault.Height)
+		u, ok := s.signedImageURL(preset, asset.Vault.Key, nil)
 		if !ok {
 			// No imgproxy signing / source configured → cannot serve an image.
 			reason := plate.ReasonCodeUnsupportedFormat
 			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
 		}
-		return plate.DeliveryResolution{
-			Intent:   intent,
-			Delivery: &plate.Delivery{Url: u, Mode: plate.Public},
+		d := &plate.Delivery{Url: u, Mode: plate.Public}
+		// Populate the OUTPUT dimensions this preset produces for this asset, so a
+		// consumer can build a zoom ladder / srcset from STRUCTURED fields instead of
+		// regex-parsing the URL (the intent-vs-width brittleness). Computed from the
+		// probed source dims + the preset's fit cap, mirroring imgproxy's
+		// resize:fit:W:W:0/enlarge:0 exactly (fit longest edge to W, preserve aspect,
+		// never enlarge). Omitted when the source wasn't probed (dims unknown).
+		if w, h, okDims := fitOutputDims(asset.Vault.Width, asset.Vault.Height, preset); okDims {
+			d.Width, d.Height = &w, &h
 		}
+		return plate.DeliveryResolution{Intent: intent, Delivery: d}
 	}
 	// Documents pass through R2 directly (no transform) — the public delivery URL.
 	if asset.Kind == plate.Document {
