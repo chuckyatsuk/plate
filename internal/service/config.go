@@ -122,8 +122,19 @@ func LoadEnv() (EnvConfig, error) {
 // become a "real" one. Add a value here whenever a throwaway keypair is generated
 // and used somewhere it could be copied from.
 var knownThrowawayKeys = map[string]bool{
-	// The 2026-09-09 smoke/demo keypair (private half lives in a .scratch file).
+	// The 2026-09-09 smoke/demo keypair. RETIRED 2026-09-10 — rotated OFF this key
+	// (its private half was never recoverable; a token minted with a candidate key
+	// 401'd against the deployed API, forcing the rotation). No deployment carries
+	// it anymore; kept as a historical guard so it can never be re-adopted.
 	"9SRBsqY2/qVTTwxviZ5GiTFKmxu8DY14lIZ0W890RwU=": true,
+
+	// The 2026-09-10 demo keypair, deployed on plate-demo-api after the rotation.
+	// It is a DEMO key: its private half is held in ~/Dev/plate/.env (gitignored,
+	// but a loose private half a token could be minted from), so by this list's
+	// rule it is throwaway-class. The demo opts past the guard with
+	// PLATE_ALLOW_THROWAWAY_KEYS=true; a real prod deployment must generate its own
+	// keypair and must NOT set that flag (a copied demo config then fails boot).
+	"SEy/Ysvsr9il4zU4jfxAmdehVhoo32K1aFVdsgA9DNc=": true,
 }
 
 func isThrowawayKey(pub string) bool {
