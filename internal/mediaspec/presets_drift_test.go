@@ -11,6 +11,7 @@ package mediaspec_test
 import (
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -33,5 +34,21 @@ func TestImgproxyDeployPresetsMatchMediaspec(t *testing.T) {
 	want := mediaspec.PresetDefs()
 	if got != want {
 		t.Fatalf("deploy IMGPROXY_PRESETS has drifted from mediaspec.PresetDefs():\n deploy:    %q\n mediaspec: %q\nRegenerate the line: go run ./cmd/plate imgproxy-presets", got, want)
+	}
+
+	// The result-edge belt must also match mediaspec — same drift risk (a literal in
+	// the deploy env can silently diverge from the single source), and it is a
+	// LOAD-BEARING clamp: it backstops the per-preset caps so no result edge can
+	// exceed the area ceiling. A deploy that drops or raises it would let the
+	// square-source area breach through.
+	reDim := regexp.MustCompile(`(?m)^\s*IMGPROXY_MAX_RESULT_DIMENSION\s*=\s*"([^"]*)"`)
+	md := reDim.FindSubmatch(raw)
+	if md == nil {
+		t.Fatalf("no IMGPROXY_MAX_RESULT_DIMENSION line in %s — the result-edge belt (mediaspec.MaxResultDimension=%d) must be set in the deploy config", tomlPath, mediaspec.MaxResultDimension)
+	}
+	gotDim := strings.TrimSpace(string(md[1]))
+	wantDim := strconv.Itoa(mediaspec.MaxResultDimension)
+	if gotDim != wantDim {
+		t.Fatalf("deploy IMGPROXY_MAX_RESULT_DIMENSION=%q has drifted from mediaspec.MaxResultDimension=%q", gotDim, wantDim)
 	}
 }

@@ -85,6 +85,12 @@ func TestDeviceClamp_ImagePresetSelection(t *testing.T) {
 		{"zoom_2_mobile_downgrades", "zoom_2", "mobile", mediaspec.PresetLightboxMobile},
 		{"zoom_3_mobile_downgrades", "zoom_3", "mobile", mediaspec.PresetLightboxMobile},
 
+		// zoom_3 on desktop fans out to an ASPECT BUCKET by the asset's probed dims
+		// (imgproxy caps the long edge, so one cap can't hold ≤24MP across aspects).
+		// This asset is 4000×3000, r=1.33 → the STANDARD band. Proves the aspect
+		// resolution runs end-to-end through the real handler.
+		{"zoom_3_desktop_aspect_bucket", "zoom_3", "desktop", mediaspec.Zoom3PresetForAspect(4000, 3000)},
+
 		// grid/thumbnail are already small — device does not change their preset.
 		{"grid_mobile_unchanged", "grid", "mobile", mediaspec.PresetGrid},
 		{"thumbnail_mobile_unchanged", "thumbnail", "mobile", mediaspec.PresetThumbnail},

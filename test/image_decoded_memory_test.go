@@ -19,6 +19,7 @@ package plate_test
 import (
 	"testing"
 
+	"github.com/chuckyatsuk/plate/internal/mediaspec"
 	"github.com/chuckyatsuk/plate/test/harness"
 )
 
@@ -102,38 +103,68 @@ func TestZoomLadder_EachRung_UnderDesktopBudgetAndMegapixelWall(t *testing.T) {
 	harness.RequireFFmpeg(t)
 	dir := t.TempDir()
 
-	// A genuine 96MP-class source (12000x8000 = 96MP), in Uri's real range. Every
-	// rung must clamp its output down from this.
-	harness.SynthImage(t, dir, "artwork96.png", 12000, 8000)
+	// 96MP-class sources ACROSS ASPECTS — the aspect is the whole point. imgproxy's
+	// resize:fit:W:W:0 caps the LONGEST EDGE, so on a wide source the short edge (and
+	// total area) stays modest, but on a NEAR-SQUARE source the same long-edge cap
+	// drives total pixels toward the 24MP wall. A landscape-only test proves the
+	// aspect that CANNOT breach; the near-square case is the one that can — and is
+	// exactly Uri's square/portrait documentation shots. (Landscape-only fixtures are
+	// what let zoom_3=5120 ship at 26MP on a square source before aspect bucketing.)
+	//
+	// For zoom_3 the bucket is chosen by the SAME resolver the service uses
+	// (mediaspec.Zoom3PresetForAspect), so this tests exactly what production serves.
+	type src struct {
+		name string
+		w, h int
+	}
+	sources := []src{
+		{"wide_2to1", 12000, 6000},   // r=2.0  → wide band
+		{"land_3to2", 12000, 8000},   // r=1.5  → standard band
+		{"land_5to4", 10000, 8000},   // r=1.25 → standard band (its squarest member)
+		{"near_square", 10000, 9000}, // r≈1.11 → near-square band
+		{"square", 9800, 9800},       // r=1.0  → near-square band (worst case)
+		{"port_2to3", 8000, 12000},   // r=1.5 portrait → standard (same as landscape)
+	}
+	for _, s := range sources {
+		harness.SynthImage(t, dir, s.name+".png", s.w, s.h)
+	}
 	ip := harness.StartImgproxy(t, dir)
 
-	rungs := []struct {
-		name   string
-		preset string
-	}{
-		{"zoom_1", harness.PresetZoom1},
-		{"zoom_2", harness.PresetZoom2},
-		{"zoom_3", harness.PresetZoom3},
+	// rung -> preset resolver. zoom_1/zoom_2 are single presets; zoom_3 fans out by
+	// aspect exactly as the service does.
+	presetFor := func(rung string, s src) string {
+		switch rung {
+		case "zoom_1":
+			return harness.PresetZoom1
+		case "zoom_2":
+			return harness.PresetZoom2
+		default:
+			return mediaspec.Zoom3PresetForAspect(s.w, s.h)
+		}
 	}
-	for _, rung := range rungs {
-		t.Run(rung.name, func(t *testing.T) {
-			cfg, status := ip.RenderConfig(t, rung.preset, "artwork96.png")
-			if status != 200 {
-				t.Fatalf("%s render returned HTTP %d, want 200 (a clamped rendition, never a 400)", rung.name, status)
-			}
 
-			outPixels := cfg.Width * cfg.Height
-			if outPixels > megapixelWallPixels {
-				t.Fatalf("%s output %dx%d = %dMP over the 24MP megapixel wall — the CDN would 400 this",
-					rung.name, cfg.Width, cfg.Height, outPixels/1_000_000)
-			}
+	for _, rung := range []string{"zoom_1", "zoom_2", "zoom_3"} {
+		for _, s := range sources {
+			t.Run(rung+"/"+s.name, func(t *testing.T) {
+				preset := presetFor(rung, s)
+				cfg, status := ip.RenderConfig(t, preset, s.name+".png")
+				if status != 200 {
+					t.Fatalf("%s (preset %s) on %s returned HTTP %d, want 200 (a clamped rendition, never a 400)", rung, preset, s.name, status)
+				}
 
-			decoded := decodedRGBABytes(cfg.Width, cfg.Height)
-			if decoded > desktopDecodedBudget {
-				t.Fatalf("%s rendition decodes to %d bytes (%dx%d × 4) — over the %d-byte (96 MiB) desktop budget; a desktop tab is at risk here",
-					rung.name, decoded, cfg.Width, cfg.Height, desktopDecodedBudget)
-			}
-		})
+				outPixels := cfg.Width * cfg.Height
+				if outPixels > megapixelWallPixels {
+					t.Fatalf("%s (preset %s) on %s output %dx%d = %dMP over the 24MP megapixel wall — the CDN would 400 this",
+						rung, preset, s.name, cfg.Width, cfg.Height, outPixels/1_000_000)
+				}
+
+				decoded := decodedRGBABytes(cfg.Width, cfg.Height)
+				if decoded > desktopDecodedBudget {
+					t.Fatalf("%s (preset %s) on %s decodes to %d bytes (%dx%d × 4) — over the %d-byte (96 MiB) desktop budget",
+						rung, preset, s.name, decoded, cfg.Width, cfg.Height, desktopDecodedBudget)
+				}
+			})
+		}
 	}
 }
 
@@ -146,14 +177,16 @@ func TestZoomLadder_Monotonic(t *testing.T) {
 	harness.RequireFFmpeg(t)
 	dir := t.TempDir()
 
-	// 8000px wide: wider than zoom_3's 5120 fit, so each rung resizes to its own
-	// distinct width rather than all passing an undersized source through unchanged.
-	harness.SynthImage(t, dir, "wide8000.png", 8000, 6000)
+	// A landscape source larger than the widest zoom_3 band (6197) on the long edge,
+	// so each rung resizes to its own distinct size (not an undersized pass-through).
+	// r=1.5 → zoom_3 resolves to the standard band via the same resolver as the service.
+	const w, h = 10000, 6667
+	harness.SynthImage(t, dir, "wide.png", w, h)
 	ip := harness.StartImgproxy(t, dir)
 
-	c1, _ := ip.RenderConfig(t, harness.PresetZoom1, "wide8000.png")
-	c2, _ := ip.RenderConfig(t, harness.PresetZoom2, "wide8000.png")
-	c3, _ := ip.RenderConfig(t, harness.PresetZoom3, "wide8000.png")
+	c1, _ := ip.RenderConfig(t, harness.PresetZoom1, "wide.png")
+	c2, _ := ip.RenderConfig(t, harness.PresetZoom2, "wide.png")
+	c3, _ := ip.RenderConfig(t, mediaspec.Zoom3PresetForAspect(w, h), "wide.png")
 
 	d1 := decodedRGBABytes(c1.Width, c1.Height)
 	d2 := decodedRGBABytes(c2.Width, c2.Height)
