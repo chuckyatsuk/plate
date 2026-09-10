@@ -1,0 +1,62 @@
+# Plate API on Fly.io (spec Q4 — Fly.io now, host-agnostic). This manifest
+# deploys the API (`plate serve`); the worker is a SEPARATE app (deploy/fly.toml).
+# Two apps, not two process groups, so each scales and sizes independently: the
+# API is light and latency-sensitive (it now also serves the granted-mode
+# /v1/download byte-edge redirect), the worker is heavy ffmpeg compute.
+#
+# ⚠️ Secrets are set with `fly secrets set` (NEVER committed). The API needs the
+# FULL read+write+delivery env — see the checklist at the bottom.
+
+app = "plate-demo-api"  # demo instance; plate-api reserved for prod (cf. the plate-demo bucket)
+primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download grant
+                        # liveness lookup and every store query hit Postgres in-region.
+
+[build]
+  # Path is relative to THIS config file's dir (deploy/), so ../ reaches the repo
+  # root where the Dockerfiles live. Deploy with the repo root as the build
+  # context: `fly deploy . -c deploy/fly.api.toml` (the Dockerfiles COPY . . the
+  # whole Go module, so the context MUST be the root, not deploy/).
+  dockerfile = "../Dockerfile"  # the API image (no ffmpeg)
+
+[env]
+  PLATE_ENV = "production"
+  PLATE_LOG_LEVEL = "info"
+  PLATE_HTTP_ADDR = ":8080"
+
+# Public HTTP service. Unlike the worker, the API serves requests — presign,
+# finalize, resolve, and the /v1/download redirect.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"   # scale to zero when idle
+  auto_start_machines = true    # wake on the first request
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/v1/readyz"          # DB/storage reachability (unauthenticated, security:[])
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[vm]]
+  # The API is light: no ffmpeg, just HTTP + Postgres + presign/redirect. A shared
+  # CPU is fine here (the performance-CPU rule is a WORKER constraint — ffmpeg on a
+  # throttled vCPU crawls; the API does no such work).
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# ── Secrets checklist (fly secrets set -a plate-demo-api …) ──────────────────
+# Required (API 503s the write path / denies tokens without these):
+#   DATABASE_URL                 the IPv4 SESSION pooler DSN (direct host is IPv6-only)
+#   R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_DEFAULT_BUCKET R2_REGION
+#   PLATE_JWT_PUBLIC_KEY         base64 raw Ed25519 — validates tokens (empty = deny-all)
+# Delivery (granted/signed/original — set so the byte edge is enforceable):
+#   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download (granted A/V + original)
+#   IMGPROXY_KEY IMGPROXY_SALT   hex — sign non-public image URLs
+#   IMGPROXY_BASE_URL            the imgproxy delivery host
+#   R2_PUBLIC_BASE               public delivery base (custom domain)
+#   PLATE_DOWNLOAD_BASE          this API's own public base: https://plate-demo-api.fly.dev
+# Optional tunables (safe defaults):
+#   PLATE_GRANTED_URL_TTL (<=120s), PLATE_GRANT_CACHE_TTL, PLATE_UPLOAD_URL_TTL,
+#   PLATE_JWT_ISSUER, PLATE_JWT_AUDIENCE

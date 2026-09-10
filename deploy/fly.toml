@@ -7,11 +7,13 @@
 # and the config questions are answered. A real deploy needs R2 + Supabase creds
 # (set as Fly secrets), which are not provisioned here.
 
-app = "plate-worker"
+app = "plate-demo-worker"  # demo instance; plate-worker reserved for prod (cf. the plate-demo bucket)
 primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/queue lookups in-region)
 
 [build]
-  dockerfile = "Dockerfile.worker"
+  # Relative to deploy/; ../ reaches the repo root. Deploy with the repo root as
+  # context: `fly deploy . -c deploy/fly.toml` (Dockerfile.worker COPYs the module).
+  dockerfile = "../Dockerfile.worker"
 
 [processes]
   worker = "work"
@@ -28,9 +30,15 @@ primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/que
 # Scratch: prefer the machine's ephemeral disk over a Fly Volume (a Volume bills
 # whether attached or not, spec Q4). PLATE_WORKER_SCRATCH_DIR is set in the image.
 
-# Secrets (set with `fly secrets set`, NEVER committed):
-#   DATABASE_URL, R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
-#   R2_DEFAULT_BUCKET, R2_REGION
+# Secrets (set with `fly secrets set -a plate-demo-worker …`, NEVER committed):
+#   DATABASE_URL   — use the IPv4 SESSION pooler DSN (postgres.<ref>@aws-0-…pooler
+#                    …:5432, ?sslmode=require). The direct db.<ref>.supabase.co host
+#                    is IPv6-ONLY; the worker's SKIP LOCKED needs session semantics,
+#                    which the 5432 session pooler (NOT the 6543 txn pooler) preserves.
+#   R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_DEFAULT_BUCKET, R2_REGION
+# The worker needs NO JWT/delivery/imgproxy keys — it pulls jobs + writes renditions;
+# it never validates tokens or mints delivery URLs. ffmpeg/ffprobe are on PATH in the
+# image (no PLATE_FFMPEG_PATH needed).
 [env]
   PLATE_ENV = "production"
   PLATE_LOG_LEVEL = "info"

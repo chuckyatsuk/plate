@@ -153,8 +153,19 @@ func work(log *slog.Logger) error {
 		DetailMaxDurationS: service.DetailMaxDurationSeconds(), // PLATE_DETAIL_MAX_DURATION, default 720
 	})
 
+	// The reconciliation sweeps (orphaned uploads + two-step deleted-asset purge,
+	// spec §5.1/§Q2) run on a ticker inside the worker — the scheduler they were
+	// built for but never had. Kept in-process (not a separate Fly cron machine):
+	// the worker already holds the store + storage, and the sweeps are periodic
+	// housekeeping. Interval + grace are env-tunable; defaults are safe.
+	reconciler := worker.NewReconciler(st, sc.Storage, log,
+		parseDurationEnv("PLATE_SWEEP_GRACE", 0),     // 0 → 6h default
+		0,                                            // batch size default (100)
+	)
+	go reconciler.SweepLoop(ctx, parseDurationEnv("PLATE_SWEEP_EVERY", 15*time.Minute))
+
 	// Graceful SIGTERM: cancel the loop's context so an in-flight job finishes or
-	// releases its lease, then exit (K8s-ready, spec Q4).
+	// releases its lease, then exit (K8s-ready, spec Q4). This also stops SweepLoop.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -168,4 +179,15 @@ func work(log *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+// parseDurationEnv reads a Go duration from an env var, falling back to def on
+// absent/invalid. Small local helper so the worker's tunables read from one place.
+func parseDurationEnv(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }
