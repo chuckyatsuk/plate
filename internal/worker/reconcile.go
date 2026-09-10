@@ -97,3 +97,44 @@ func (r *Reconciler) SweepDeletedAssets(ctx context.Context) (int, error) {
 	}
 	return purged, nil
 }
+
+// SweepLoop runs both reconciliation passes on a ticker until ctx is cancelled —
+// the scheduler the sweeps were always meant to have (§5.1, §Q2: "a cron, or a
+// ticker inside plate work"). It runs INSIDE the worker process rather than as a
+// separate Fly cron machine: the worker already holds the store + storage, and
+// the sweeps are periodic housekeeping, not latency-sensitive. A pass that errors
+// is logged and retried next tick — one bad sweep never stops the loop, the same
+// discipline as the job loop. It runs one pass immediately on start so a
+// freshly-deployed worker does not wait a full interval before its first sweep.
+func (r *Reconciler) SweepLoop(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = 15 * time.Minute
+	}
+	r.log.Info("reconcile: sweep loop started", "every", every, "grace", r.grace)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		r.sweepBoth(ctx)
+		select {
+		case <-ctx.Done():
+			r.log.Info("reconcile: sweep loop stopping")
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// sweepBoth runs one pass of each sweep, logging counts. Errors are logged, not
+// returned — the loop must survive a transient store/storage hiccup.
+func (r *Reconciler) sweepBoth(ctx context.Context) {
+	if n, err := r.SweepOnce(ctx); err != nil {
+		r.log.Warn("reconcile: orphan-upload sweep failed", "err", err)
+	} else if n > 0 {
+		r.log.Info("reconcile: orphan-upload sweep done", "cleaned", n)
+	}
+	if n, err := r.SweepDeletedAssets(ctx); err != nil {
+		r.log.Warn("reconcile: deleted-asset sweep failed", "err", err)
+	} else if n > 0 {
+		r.log.Info("reconcile: deleted-asset sweep done", "purged", n)
+	}
+}

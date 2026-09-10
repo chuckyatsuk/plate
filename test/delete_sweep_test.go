@@ -57,3 +57,39 @@ func TestE2E_DeletedAsset_BytesBecomeUnreachable(t *testing.T) {
 		t.Fatal("deleted asset's bytes are STILL in storage after the purge sweep — the two-step delete does not actually delete")
 	}
 }
+
+// The SCHEDULER, not just the sweep function: SweepLoop (now wired into
+// `plate work`) must actually invoke the purge on its ticker. Without this, the
+// sweep exists but nothing runs it — the exact "built but never scheduled" gap
+// this step closes. Proven by starting the loop and watching a deleted asset's
+// bytes vanish, then cancelling.
+func TestE2E_SweepLoop_PurgesOnTicker(t *testing.T) {
+	e := newE2E(t, 720)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+
+	assetID := e.uploadAndFinalize(harness.SynthImage(t, dir, "doomed.png", 320, 240), "image/png")
+	key := e.account + "/" + assetID
+	if resp := e.req("DELETE", "/v1/assets/"+assetID, nil); resp.Code != 202 {
+		t.Fatalf("deleteAsset should be 202; got %d", resp.Code)
+	}
+
+	// Negative grace → eligible immediately; a short tick → the loop runs a pass
+	// almost at once (SweepLoop also sweeps once on entry).
+	rec := worker.NewReconciler(e.st, e.stor.Storage, slog.Default(), -time.Second, 100)
+	go rec.SweepLoop(ctx, 50*time.Millisecond)
+
+	// Wait for the loop to purge the bytes (poll up to a few seconds).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, _ := e.stor.Storage.Head(ctx, key)
+		if !info.Exists {
+			break // the loop purged it
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("SweepLoop did not purge the deleted asset's bytes — the ticker is not driving the sweep")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
