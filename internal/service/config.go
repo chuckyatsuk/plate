@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/chuckyatsuk/plate/internal/auth"
@@ -49,8 +50,12 @@ func LoadEnv() (EnvConfig, error) {
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		URLs: URLBuilder{
 			ImageCDNBase: os.Getenv("IMGPROXY_BASE_URL"),
-			R2PublicBase: os.Getenv("R2_PUBLIC_BASE"),
-			DownloadBase: envOr("PLATE_DOWNLOAD_BASE", "https://plate.example"),
+			// imgproxy reads originals as a PRIVATE S3 source from this bucket
+			// (s3://{bucket}/vault/...), so the vault original is never publicly
+			// reachable. Same bucket as storage; imgproxy holds its own R2 creds.
+			ImageSourceBucket: os.Getenv("R2_DEFAULT_BUCKET"),
+			R2PublicBase:      os.Getenv("R2_PUBLIC_BASE"),
+			DownloadBase:      envOr("PLATE_DOWNLOAD_BASE", "https://plate.example"),
 		},
 		DeliverySigningKey: os.Getenv("PLATE_DELIVERY_SIGNING_KEY"),
 		ImgproxyKey:        os.Getenv("IMGPROXY_KEY"),
@@ -72,6 +77,16 @@ func LoadEnv() (EnvConfig, error) {
 	if cfg.DatabaseURL == "" {
 		return EnvConfig{}, errors.New("service: DATABASE_URL is required")
 	}
+	// Fail fast on the Supabase TRANSACTION pooler (port 6543). Plate's worker
+	// queue uses SELECT ... FOR UPDATE SKIP LOCKED and goose runs DDL — both need
+	// SESSION semantics, which the transaction pooler (6543) does not provide;
+	// they break in subtle, runtime-only ways there. The IPv4 SESSION pooler
+	// (5432) is correct (the direct host is IPv6-only). Refuse to boot on 6543
+	// rather than half-work (spec Q4; the connection lesson, 2026-09-09).
+	if strings.Contains(cfg.DatabaseURL, ":6543") {
+		return EnvConfig{}, errors.New(
+			"service: DATABASE_URL points at the Supabase TRANSACTION pooler (port 6543), which lacks the session semantics SKIP LOCKED + goose DDL require — use the SESSION pooler (port 5432) instead (the direct db.<ref> host is IPv6-only)")
+	}
 
 	// The validation key is optional at boot: with no key, the process still
 	// starts and the unauthenticated health/readiness probes work (spec: those
@@ -84,12 +99,35 @@ func LoadEnv() (EnvConfig, error) {
 		cfg.Verifier = auth.DenyAllVerifier()
 		return cfg, nil
 	}
+	// Refuse to boot on a KNOWN-THROWAWAY key (the demo/smoke keypair) unless the
+	// operator explicitly opts in with PLATE_ALLOW_THROWAWAY_KEYS=true. This keeps
+	// a demo key from silently reaching a real deployment: the demo sets the flag
+	// deliberately; prod never does, so a copied .env fails loud at boot instead of
+	// accepting tokens signed by a key whose private half is in a scratch file.
+	if isThrowawayKey(keyStr) && os.Getenv("PLATE_ALLOW_THROWAWAY_KEYS") != "true" {
+		return EnvConfig{}, errors.New(
+			"service: PLATE_JWT_PUBLIC_KEY is a KNOWN-THROWAWAY demo key — generate a real Ed25519 keypair for this deployment, or set PLATE_ALLOW_THROWAWAY_KEYS=true if this is intentionally the demo")
+	}
 	pub, err := loadEd25519Public(keyStr)
 	if err != nil {
 		return EnvConfig{}, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEY: %w", err)
 	}
 	cfg.Verifier = auth.NewVerifier(pub, os.Getenv("PLATE_JWT_ISSUER"), os.Getenv("PLATE_JWT_AUDIENCE"))
 	return cfg, nil
+}
+
+// knownThrowawayKeys are public keys minted as demo/smoke throwaways this project
+// has used. A deployment carrying one of these must opt in explicitly
+// (PLATE_ALLOW_THROWAWAY_KEYS=true) or fail boot — so a demo key cannot silently
+// become a "real" one. Add a value here whenever a throwaway keypair is generated
+// and used somewhere it could be copied from.
+var knownThrowawayKeys = map[string]bool{
+	// The 2026-09-09 smoke/demo keypair (private half lives in a .scratch file).
+	"9SRBsqY2/qVTTwxviZ5GiTFKmxu8DY14lIZ0W890RwU=": true,
+}
+
+func isThrowawayKey(pub string) bool {
+	return knownThrowawayKeys[strings.TrimSpace(pub)]
 }
 
 func envOr(k, def string) string {

@@ -1,0 +1,76 @@
+# imgproxy on Fly.io — the image transform engine Plate's delivery URLs point at
+# (spec §2, §4.1). Plate builds image URLs as {IMGPROXY_BASE_URL}/{preset}/plain/
+# {vaultKey}; this app transforms the vault original per the named preset and
+# serves it. It is a SEPARATE app (prebuilt public image, not our source), like
+# the API and worker — three apps, each sized/scaled on its own.
+#
+# ⚠️ Uses the prebuilt darthsim/imgproxy image, so there is NO [build] — `image =`.
+# Deploy: `fly deploy -a plate-demo-imgproxy -c deploy/fly.imgproxy.toml`
+# (no build context needed; nothing is built from source).
+
+app = "plate-demo-imgproxy"
+primary_region = "iad"  # near the API + Supabase; imgproxy fetches originals over HTTPS
+
+[build]
+  image = "darthsim/imgproxy:latest"
+
+[env]
+  # ONLY_PRESETS: refuse ad-hoc width/quality/crop params — a caller can only name
+  # a purpose (spec §4.1). This is the lockdown that makes "intent, not
+  # transformation" structural, and what the image-clamp tests rely on.
+  IMGPROXY_ONLY_PRESETS = "true"
+
+  # Presets: the intent→resize definitions. MUST equal `plate imgproxy-presets`
+  # (mediaspec.PresetDefs — the single source the image-clamp tests verify). If
+  # mediaspec changes, regenerate this line:  go run ./cmd/plate imgproxy-presets
+  IMGPROXY_PRESETS = "lightbox=resize:fit:2048:0:0/enlarge:0,lightbox_mobile=resize:fit:1400:0:0/enlarge:0,thumbnail=resize:fit:400:0:0/enlarge:0,grid=resize:fit:800:0:0/enlarge:0"
+
+  # Origin: imgproxy fetches originals via PRIVATE S3 (R2), so a vault original is
+  # NEVER publicly reachable (the wall, spec §3.1/Q5). Plate emits image sources as
+  # s3://{bucket}/vault/{account}/{asset}; imgproxy resolves them with its own R2
+  # credentials (set as secrets, below). There is deliberately NO IMGPROXY_BASE_URL
+  # here — the source is a full s3:// URL, and a public HTTP base would reopen the
+  # very hole this closes.
+  IMGPROXY_USE_S3 = "true"
+  IMGPROXY_S3_ENDPOINT = "https://87c7daae690b39a2efedf6ef10773606.r2.cloudflarestorage.com"
+  IMGPROXY_S3_REGION = "auto"
+
+  # Headroom so a large original is CLAMPED by the preset, not rejected as
+  # oversized (spec §7: "returns a clamped rendition, never a 400"). 100MP covers
+  # the biggest studio shots.
+  IMGPROXY_MAX_SRC_RESOLUTION = "100"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"          # imgproxy's built-in health endpoint
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"      # image transforms are light per-request; scale out, not up
+  memory = "512mb"
+
+# ── Secrets (fly secrets set -a plate-demo-imgproxy …) ───────────────────────
+# 1. Signing — MUST match the API's IMGPROXY_KEY / IMGPROXY_SALT, or imgproxy runs
+#    unsafe and Plate's signed URLs won't verify:
+#      IMGPROXY_KEY   (hex)  — same value as on plate-demo-api
+#      IMGPROXY_SALT  (hex)  — same value as on plate-demo-api
+# 2. R2 credentials for the private S3 origin (AWS-standard names imgproxy reads):
+#      AWS_ACCESS_KEY_ID       = R2_ACCESS_KEY_ID
+#      AWS_SECRET_ACCESS_KEY   = R2_SECRET_ACCESS_KEY
+#    Scope: this token needs READ on vault/* (imgproxy only reads originals).
+#
+# ⚠️ BUCKET POLICY (R2 dashboard, done ONCE, not a Fly secret): the plate-demo
+# bucket's PUBLIC access (the plate-demo.everysinglefile.com custom domain) must be
+# scoped to the `delivery/` prefix ONLY — `vault/` must NOT be publicly readable.
+# That scoping is what makes the wall structural; imgproxy reaches vault/ only via
+# the private S3 credential above. Verify: GET https://plate-demo.everysinglefile.com/
+# vault/<any-key> returns 403/404, while a delivery/ rendition returns 200.

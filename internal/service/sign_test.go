@@ -117,22 +117,42 @@ func TestImgproxySigner_KnownAnswerFormat(t *testing.T) {
 
 func TestImgproxySigner_ExpInSignedPath(t *testing.T) {
 	s := newImgproxySigner("6b6579", "73616c74")
-	url := s.signedImageURL("https://cdn.example", "lightbox", "acct/asset", timeUnix(1700000000))
+	exp := timeUnix(1700000000)
+	src := "s3://plate-demo/vault/acct/asset"
+	url := s.signedImageURL("https://cdn.example", "lightbox", src, &exp)
 	// The exp: option must be INSIDE the signed path (so imgproxy enforces it),
-	// between the preset and the plain source.
-	if !strings.Contains(url, "/lightbox/exp:1700000000/plain/acct/asset") {
-		t.Fatalf("exp must sit in the signed path between preset and source; got %q", url)
+	// between the preset and the plain source; source is the private S3 URL.
+	if !strings.Contains(url, "/lightbox/exp:1700000000/plain/"+src) {
+		t.Fatalf("exp must sit in the signed path between preset and s3 source; got %q", url)
 	}
 	if !strings.HasPrefix(url, "https://cdn.example/") {
 		t.Fatalf("must be built on the base; got %q", url)
 	}
 }
 
-func TestAssetIDFromRenditionKey(t *testing.T) {
-	if got := assetIDFromRenditionKey("acct/asset123/detail"); got != "asset123" {
-		t.Errorf("expected asset123, got %q", got)
+func TestImgproxySigner_PublicOmitsExp(t *testing.T) {
+	s := newImgproxySigner("6b6579", "73616c74")
+	src := "s3://plate-demo/vault/acct/asset"
+	url := s.signedImageURL("https://cdn.example", "lightbox", src, nil) // public: no exp
+	if strings.Contains(url, "exp:") {
+		t.Fatalf("a public image URL must have NO exp (stable + cacheable); got %q", url)
 	}
-	for _, bad := range []string{"", "acct/asset", "a/b/c/d", "flat"} {
+	if !strings.Contains(url, "/lightbox/plain/"+src) {
+		t.Fatalf("public URL must be /{sig}/lightbox/plain/{src}; got %q", url)
+	}
+}
+
+func TestAssetIDFromRenditionKey(t *testing.T) {
+	// A/V rendition key: delivery/{account}/{asset}/{intent}
+	if got := assetIDFromRenditionKey("delivery/acct/asset123/detail"); got != "asset123" {
+		t.Errorf("rendition key: expected asset123, got %q", got)
+	}
+	// Vault key (original download): vault/{account}/{asset}
+	if got := assetIDFromRenditionKey("vault/acct/asset123"); got != "asset123" {
+		t.Errorf("vault key: expected asset123, got %q", got)
+	}
+	// Old flat shapes and malformed keys must not resolve.
+	for _, bad := range []string{"", "acct/asset", "acct/asset/detail", "a/b/c/d/e", "flat", "wrong/acct/asset/detail"} {
 		if got := assetIDFromRenditionKey(bad); got != "" {
 			t.Errorf("malformed key %q should yield \"\", got %q", bad, got)
 		}

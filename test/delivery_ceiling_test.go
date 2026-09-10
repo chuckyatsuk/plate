@@ -16,6 +16,7 @@ package plate_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -41,6 +42,7 @@ type e2e struct {
 	worker  *worker.Worker
 	token   string
 	account string
+	priv    ed25519.PrivateKey // to mint tokens for OTHER accounts in a test
 }
 
 func newE2E(t *testing.T, detailCeilingS float64) *e2e {
@@ -65,6 +67,11 @@ func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 		Prober:   probe.New(""),
 		URLs: service.URLBuilder{
 			ImageCDNBase: "https://cdn.example",
+			// imgproxy reads originals as a private S3 source from this bucket;
+			// the image tests assert the URL SHAPE (they don't fetch through the
+			// harness imgproxy, which uses local:// — the clamp tests build their
+			// own /unsafe/local:// URLs directly).
+			ImageSourceBucket: m.Bucket,
 			// Point the A/V public base at the REAL MinIO bucket URL, so a resolved
 			// detail URL is genuinely fetchable and the "real bytes" assertion means
 			// something. {endpoint}/{bucket} + /{renditionKey} = the object URL.
@@ -97,6 +104,7 @@ func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 		t: t, st: st, stor: m, handler: svc.Router(), worker: w,
 		token:   signToken(t, priv, acct, "assets:read,assets:write,renditions:generate,grants:manage"),
 		account: acct,
+		priv:    priv,
 	}
 }
 

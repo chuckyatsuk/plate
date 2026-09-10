@@ -18,14 +18,22 @@ primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/que
 [processes]
   worker = "work"
 
-# The workload is bursty ingest, idle most of the time (spec Q4): scale to zero
-# when the queue is empty, spin up on demand. No public services — the worker
-# pulls jobs from Postgres, it does not serve HTTP.
+# The transcode workload is bursty ingest, idle most of the time (spec Q4). But
+# the worker ALSO runs the reconciliation sweep loop (orphaned uploads + deleted-
+# asset purge) on a ticker in-process — and scaling to zero would SILENTLY stop
+# reconciliation, letting orphaned R2 objects and marked-deleted bytes accumulate
+# forever with no error. So keep one machine always running. This is NOT a latency
+# setting; it is what keeps the sweeps alive (designer 2026-09-10). If the sweeps
+# ever move to a separate scheduled machine, this can go back to scale-to-zero.
 [[vm]]
   # ⚠️ performance CPU, never shared: ffmpeg on a throttled shared vCPU crawls and
   # would blow the duration ceilings (spec Q4).
   size = "performance-2x"  # 2 perf CPU / 4GB — a 12-min source ~30min compute
   memory = "4gb"
+# ⚠️ Keep ONE machine always up so the sweep loop runs (see above). The worker has
+# no [http_service], so this is enforced at deploy with
+# `fly scale count worker=1 -a plate-demo-worker` (the process group is "worker",
+# not the default "app"), not an auto_stop setting.
 
 # Scratch: prefer the machine's ephemeral disk over a Fly Volume (a Volume bills
 # whether attached or not, spec Q4). PLATE_WORKER_SCRATCH_DIR is set in the image.

@@ -31,6 +31,12 @@ var ErrNotFound = errors.New("store: not found for this account")
 // maps it to a denial without echoing the foreign id.
 var ErrForeignAsset = errors.New("store: asset not owned by this account")
 
+// ErrUnknownAccount is returned when a write references an account that has no
+// row yet (uploads.account's FK). It means the account was never provisioned
+// (`plate accounts create`), NOT a server fault — the service maps it to a
+// legible 4xx, never a 500 (spec Q2, account lifecycle is out-of-band).
+var ErrUnknownAccount = errors.New("store: account has not been provisioned")
+
 // Store is the account-scoped read path (Phase 1) plus the seams the isolation
 // conformance test drives across every endpoint. EVERY method takes the caller's
 // account as its first argument — the account the service derived from the token

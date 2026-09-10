@@ -9,6 +9,7 @@ import (
 	"github.com/chuckyatsuk/plate/internal/id"
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -220,6 +221,28 @@ func (p *Postgres) ResolveGrantForDelivery(ctx context.Context, grantID, assetID
 	return v, nil
 }
 
+// CreateAccount provisions an account row — the CONTROL-PLANE operation that must
+// happen before an account can own uploads (uploads.account REFERENCES
+// accounts.id, so a token whose account has no row 409s at first upload). It is
+// deliberately NOT on the Store interface: account lifecycle is an operator
+// action (the `plate accounts create` subcommand), not part of the account-scoped
+// data-plane surface the isolation-conformance test drives — putting it there
+// would speculatively add a cross-account provisioning verb to that enum (spec Q2,
+// designer 2026-09-10). Idempotent: re-provisioning the same id updates its
+// storage bucket/prefix rather than erroring.
+func (p *Postgres) CreateAccount(ctx context.Context, accountID, bucket, prefix string) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO accounts (id, storage_bucket, storage_prefix)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO UPDATE SET storage_bucket = EXCLUDED.storage_bucket,
+		                               storage_prefix = EXCLUDED.storage_prefix`,
+		accountID, bucket, prefix)
+	if err != nil {
+		return fmt.Errorf("store: create account %q: %w", accountID, err)
+	}
+	return nil
+}
+
 func (p *Postgres) AssetOwnedBy(ctx context.Context, account, assetID string) (bool, error) {
 	var exists bool
 	err := p.pool.QueryRow(ctx, `
@@ -236,6 +259,15 @@ func (p *Postgres) CreateUpload(ctx context.Context, account string, u Upload) e
 		VALUES ($1, $2, $3, $4, $5, $6)`,
 		u.ID, account, u.Key, u.ContentType, u.SizeBytes, nullStr(u.Filename))
 	if err != nil {
+		// A foreign-key violation on uploads.account means the account was never
+		// provisioned (`plate accounts create`) — a client/config error, not a
+		// server fault. Surface it as ErrUnknownAccount so the handler answers a
+		// legible 4xx instead of a bare 500 (the "first upload against a missing
+		// account" trap, spec Q2).
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
+			return ErrUnknownAccount
+		}
 		return fmt.Errorf("store: create upload: %w", err)
 	}
 	return nil

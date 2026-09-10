@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -57,21 +58,43 @@ func encode(b [16]byte) string {
 	return string(out[:])
 }
 
+// The vault/delivery wall is a STORAGE SHAPE, not a per-object ACL (spec §3.1,
+// Q5, designer 2026-09-10). Originals live under the `vault/` prefix, renditions
+// under `delivery/`. A bucket policy makes ONLY `delivery/*` publicly readable, so
+// a vault original is structurally unreachable over the public delivery base — no
+// per-object permission to forget, no public URL that could ever name an original.
+// imgproxy reads originals via a PRIVATE S3 credential (s3://bucket/vault/...),
+// never the public base. These two prefixes are the load-bearing halves of the wall.
+const (
+	// VaultPrefix is the never-public home of immutable originals.
+	VaultPrefix = "vault/"
+	// DeliveryPrefix is the publicly-readable home of derived renditions.
+	DeliveryPrefix = "delivery/"
+)
+
 // VaultKey returns the storage key for an asset's vault original:
-// `{account}/{asset-id}` (spec §3.2). This is the per-account prefix that makes
-// account isolation structural at the storage layer — never derived from a
+// `vault/{account}/{asset-id}` (spec §3.2). The `{account}/` segment is the
+// per-account prefix that makes account isolation structural; the `vault/` prefix
+// puts every original on the never-public side of the wall. Never derived from a
 // request parameter, always from the caller's account claim.
 func VaultKey(account, assetID string) string {
-	return account + "/" + assetID
+	return VaultPrefix + account + "/" + assetID
 }
 
 // RenditionKey returns the storage key for a rendition derived from a vault
-// original: `{vault-key}/{intent}`. It is SHARED by the worker (which writes the
-// object here) and the delivery layer (which builds the URL pointing here) so the
-// two cannot drift — a rendition marked ready must resolve to the exact bytes the
-// worker wrote (the deployed-smoke bug: delivery pointed at a different path than
-// the worker wrote). The intent is passed as a string so this package stays free
-// of the generated contract types.
+// original: `delivery/{account}/{asset-id}/{intent}`. It is SHARED by the worker
+// (which writes the object here) and the delivery layer (which builds the URL
+// pointing here) so the two cannot drift — a rendition marked ready must resolve
+// to the exact bytes the worker wrote (the deployed-smoke bug: delivery pointed at
+// a different path than the worker wrote). The rendition sits under `delivery/`
+// (public side); note it does NOT nest under the vault key — it is a sibling under
+// the delivery prefix, sharing only the `{account}/{asset-id}` middle. The intent
+// is a string so this package stays free of the generated contract types.
 func RenditionKey(vaultKey, intent string) string {
-	return vaultKey + "/" + intent
+	// vaultKey is `vault/{account}/{asset}`; swap the vault prefix for delivery/
+	// and append the intent, so the two sides share the {account}/{asset} identity
+	// but live under their own wall-halves. TrimPrefix (not a raw slice) so a key
+	// without the vault prefix degrades safely instead of corrupting.
+	rel := strings.TrimPrefix(vaultKey, VaultPrefix) // {account}/{asset}
+	return DeliveryPrefix + rel + "/" + intent
 }

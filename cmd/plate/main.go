@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chuckyatsuk/plate/internal/mediaspec"
 	"github.com/chuckyatsuk/plate/internal/service"
 	"github.com/chuckyatsuk/plate/internal/store"
 	"github.com/chuckyatsuk/plate/internal/worker"
@@ -24,7 +26,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: plate <serve|work>")
+		fmt.Fprintln(os.Stderr, "usage: plate <serve|work|imgproxy-presets>")
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)) // structured logs to stdout (twelve-factor)
@@ -40,10 +42,61 @@ func main() {
 			log.Error("work failed", "err", err)
 			os.Exit(1)
 		}
+	case "imgproxy-presets":
+		// Print the IMGPROXY_PRESETS value from mediaspec — the SINGLE source of
+		// truth the tests verify against (spec C1). The imgproxy deploy sources its
+		// presets from this, so the presets production serves cannot drift from the
+		// ones the image-clamp tests prove. Not a running mode; a config emitter.
+		fmt.Println(mediaspec.PresetDefs())
+	case "accounts":
+		if err := accounts(log); err != nil {
+			log.Error("accounts failed", "err", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work)\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work|accounts|imgproxy-presets)\n", os.Args[1])
 		os.Exit(2)
 	}
+}
+
+// accounts is the control-plane subcommand for account lifecycle. Today it does
+// one thing — `plate accounts create <id> [--bucket B] [--prefix P]` — the
+// out-of-band provisioning step an account needs before its first upload (there
+// is deliberately no POST /v1/accounts yet; account lifecycle is an operator
+// action, not a data-plane verb — spec Q2). Reuses the same DATABASE_URL the
+// server does.
+func accounts(log *slog.Logger) error {
+	fs := flag.NewFlagSet("accounts", flag.ExitOnError)
+	bucket := fs.String("bucket", "", "per-account storage bucket (optional; defaults to the deployment bucket)")
+	prefix := fs.String("prefix", "", "per-account storage prefix (optional)")
+	// os.Args: plate accounts create <id> [flags]
+	if len(os.Args) < 4 || os.Args[2] != "create" {
+		return fmt.Errorf("usage: plate accounts create <account-id> [--bucket B] [--prefix P]")
+	}
+	accountID := os.Args[3]
+	if err := fs.Parse(os.Args[4:]); err != nil {
+		return err
+	}
+	if accountID == "" {
+		return fmt.Errorf("account id is required: plate accounts create <account-id>")
+	}
+
+	ctx := context.Background()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return fmt.Errorf("DATABASE_URL is required")
+	}
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if err := st.CreateAccount(ctx, accountID, *bucket, *prefix); err != nil {
+		return err
+	}
+	log.Info("account provisioned", "id", accountID, "bucket", *bucket, "prefix", *prefix)
+	return nil
 }
 
 func serve(log *slog.Logger) error {

@@ -122,9 +122,10 @@ func runWithService(m *testing.M) int {
 		Storage:  stor,
 		Prober:   prober,
 		URLs: service.URLBuilder{
-			ImageCDNBase: "https://cdn.example",
-			R2PublicBase: "https://r2.example",
-			DownloadBase: "https://plate.example",
+			ImageCDNBase:      "https://cdn.example",
+			ImageSourceBucket: "test-bucket",
+			R2PublicBase:      "https://r2.example",
+			DownloadBase:      "https://plate.example",
 		},
 	})
 

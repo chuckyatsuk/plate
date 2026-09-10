@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -78,6 +79,12 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 		SizeBytes:   req.SizeBytes,
 		Filename:    filename,
 	}); err != nil {
+		if errors.Is(err, store.ErrUnknownAccount) {
+			// The token's account has no row yet — provision it with
+			// `plate accounts create <id>`. A client/config error, not a 500.
+			writeError(w, http.StatusForbidden, "unknown_account", "this account is not provisioned; an operator must create it before uploads are accepted")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal", "could not record upload")
 		return
 	}

@@ -223,13 +223,29 @@ func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID s
 	d.Expires = &exp
 
 	switch asset.Kind {
-	case plate.Image, plate.Document:
+	case plate.Image:
 		if s.imgsigner == nil {
 			return nil, false
 		}
-		// Rebuild as an imgproxy-signed URL (the base d.Url was the unsigned
-		// preset path). The preset is the intent; the source is the vault key.
-		d.Url = s.imgsigner.signedImageURL(s.urls.ImageCDNBase, string(intent), asset.Vault.Key, exp)
+		// Granted image: an imgproxy-signed URL WITH expiry (imgproxy enforces the
+		// exp; grant liveness can't be checked at imgproxy — the capped asymmetry).
+		u, ok := s.signedImageURL(string(intent), asset.Vault.Key, &exp)
+		if !ok {
+			return nil, false
+		}
+		d.Url = u
+		return d, true
+	case plate.Document:
+		// Documents pass through R2 like A/V (the base d.Url is already the public
+		// delivery-prefix URL); granted enforcement for them rides the same path as
+		// A/V below rather than imgproxy.
+		if s.signer == nil {
+			return nil, false
+		}
+		rendKey := id.RenditionKey(asset.Vault.Key, string(intent))
+		base := s.urls.DownloadBase + "/v1/download/" + rendKey +
+			"?intent=" + url.QueryEscape(string(intent)) + "&grant=" + url.QueryEscape(grantID)
+		d.Url = s.signer.sign(base, string(intent), grantID, exp)
 		return d, true
 	default: // video/audio → the /download redirect, verified + liveness-checked
 		if s.signer == nil {
@@ -330,15 +346,40 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, target, http.StatusFound)
 }
 
-// assetIDFromRenditionKey extracts the asset id (the middle segment) from a
-// rendition key `{account}/{asset-id}/{intent}`. Returns "" if the shape is
-// wrong. Used by the download edge to re-check grant liveness against the asset.
+// signedImageURL builds the imgproxy-signed delivery URL for an image intent:
+// an imgproxy URL whose SOURCE is the PRIVATE S3 vault original
+// (s3://{bucket}/vault/...), never the public base — so imgproxy reads the
+// original with its own R2 credentials and the vault is never publicly reachable
+// (the wall, spec §3.1/Q5). Because imgproxy checks ALL URLs once keyed, EVERY
+// image URL is signed — public (exp nil: stable, cacheable) and granted (exp set:
+// imgproxy enforces the window). Returns ok=false when imgproxy signing or the
+// source bucket is not configured (fail closed — no unsigned image URL ships).
+func (s *Service) signedImageURL(intent, vaultKey string, exp *time.Time) (string, bool) {
+	if s.imgsigner == nil {
+		return "", false
+	}
+	src := s.urls.imgproxySource(vaultKey)
+	if src == "" {
+		return "", false
+	}
+	return s.imgsigner.signedImageURL(s.urls.ImageCDNBase, intent, src, exp), true
+}
+
+// assetIDFromRenditionKey extracts the asset id from a rendition key. Since the
+// vault/delivery split, that key is `delivery/{account}/{asset-id}/{intent}`
+// (4 segments) and the vault key is `vault/{account}/{asset-id}` (3). Accept both
+// shapes and return the asset id (second-to-last for a rendition, last for a
+// vault key), or "" if the shape is unrecognized. Used by the download edge to
+// re-check grant liveness against the asset the signed key names.
 func assetIDFromRenditionKey(key string) string {
 	parts := strings.Split(key, "/")
-	if len(parts) != 3 {
-		return ""
+	switch {
+	case len(parts) == 4 && parts[0] == id.DeliveryPrefix[:len(id.DeliveryPrefix)-1]:
+		return parts[2] // delivery/{account}/{asset}/{intent}
+	case len(parts) == 3 && parts[0] == id.VaultPrefix[:len(id.VaultPrefix)-1]:
+		return parts[2] // vault/{account}/{asset} (original download)
 	}
-	return parts[1]
+	return ""
 }
 
 // resolveNonOriginal resolves a non-original intent against the asset's real
@@ -350,9 +391,24 @@ func assetIDFromRenditionKey(key string) string {
 //     delivery:null + the rendition's reason (the §4.3 honest refusal, e.g.
 //     exceeded_duration_ceiling); pending/absent → delivery:null, reason:pending.
 func (s *Service) resolveNonOriginal(intent plate.Intent, asset plate.Asset) plate.DeliveryResolution {
-	// A failed/pending PROBE blocks everything derived from the object.
-	// (probe_status lives on the asset; exposed via the store as a field.)
-	if asset.Kind == plate.Image || asset.Kind == plate.Document {
+	// Images resolve immediately (imgproxy transforms the vault original on the
+	// fly — no rendition row needed). PUBLIC images are still imgproxy-SIGNED (exp
+	// nil: stable + cacheable) because imgproxy checks all URLs once keyed; the
+	// signature is tamper-protection on the transform params, not access control.
+	if asset.Kind == plate.Image {
+		u, ok := s.signedImageURL(string(intent), asset.Vault.Key, nil)
+		if !ok {
+			// No imgproxy signing / source configured → cannot serve an image.
+			reason := plate.ReasonCodeUnsupportedFormat
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
+		}
+		return plate.DeliveryResolution{
+			Intent:   intent,
+			Delivery: &plate.Delivery{Url: u, Mode: plate.Public},
+		}
+	}
+	// Documents pass through R2 directly (no transform) — the public delivery URL.
+	if asset.Kind == plate.Document {
 		res, err := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
 		if err != nil {
 			reason := plate.ReasonCodeUnsupportedFormat
