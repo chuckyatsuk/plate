@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/chuckyatsuk/plate/internal/storage"
+	testcontainers "github.com/testcontainers/testcontainers-go"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 )
 
@@ -33,9 +34,19 @@ func StartMinIO(t *testing.T, bucket string) *MinIO {
 	ctx := context.Background()
 	const user, pass = "plate", "plate-secret"
 
-	c, err := tcminio.Run(ctx, "minio/minio:latest",
+	// Pinned MinIO image, pulled from quay.io — NOT Docker Hub. Docker Hub now
+	// denies anonymous pulls of minio/minio (HTTP 401 "may require docker login",
+	// its anonymous rate-limit), which turned CI red for every PR (2026-09-12);
+	// quay.io serves the same image anonymously. PINNED to a RELEASE tag, not
+	// :latest — the unpinned tag is what made this a time-bomb (green until the
+	// registry policy shifted). The quay image is linux/amd64-only, so pin the
+	// platform explicitly: native on CI (ubuntu amd64), emulated on Apple-Silicon
+	// dev (without this, arm64 hosts fail with "no matching manifest for arm64").
+	// Keep it pinned + on quay + amd64; bump the tag deliberately.
+	c, err := tcminio.Run(ctx, "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z.hotfix.c630804a1",
 		tcminio.WithUsername(user),
 		tcminio.WithPassword(pass),
+		testcontainers.WithImagePlatform("linux/amd64"),
 	)
 	if err != nil {
 		t.Fatalf("harness: start minio: %v", err)
