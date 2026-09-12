@@ -58,7 +58,17 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
 # Delivery (granted/signed/original — set so the byte edge is enforceable):
 #   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download (granted A/V + original)
 #   IMGPROXY_KEY IMGPROXY_SALT   hex — sign non-public image URLs
-#   IMGPROXY_BASE_URL            the imgproxy delivery host
+#   IMGPROXY_BASE_URL            the imgproxy delivery host — point at a CDN-FRONTED
+#                                hostname, NOT the raw *.fly.dev app. imgproxy
+#                                renditions are immutable (signed path) + send
+#                                max-age=1yr, so a Cloudflare-proxied host with a
+#                                cache rule serves edge HITs instead of reprocessing
+#                                every request at the single-region Fly origin
+#                                (~0.7s → ~0.15s, verified 2026-09-12). Demo uses
+#                                https://plate-demo-img.everysinglefile.com (CF orange
+#                                → plate-demo-imgproxy.fly.dev, "Eligible for cache",
+#                                respect-origin TTL). Prod should bake its own CDN host
+#                                in from day one so no URL migration is ever needed.
 #   R2_PUBLIC_BASE               public delivery base (custom domain)
 #   PLATE_DOWNLOAD_BASE          this API's own public base: https://plate-demo-api.fly.dev
 # Optional tunables (safe defaults):
