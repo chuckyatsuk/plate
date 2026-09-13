@@ -325,6 +325,7 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	intent := q.Get("intent")
 	grantID := q.Get("grant")
+	exportID := q.Get("export")
 	if key == "" || intent == "" {
 		deny()
 		return
@@ -335,7 +336,30 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// checked against what Plate minted, independent of how the request arrived.
 	signedURL := s.urls.DownloadBase + "/v1/download/" + key + "?" + r.URL.RawQuery
 
-	if intent == string(plate.Original) {
+	if exportID != "" {
+		// Export capability: originals ONLY (an export is the owner's route to raw
+		// bytes, never a rendition), and never combined with a grant. The signature
+		// is verified against the export context, so a grant id or the owner
+		// sentinel can never validate an export URL, nor the reverse.
+		if intent != string(plate.Original) || grantID != "" ||
+			!s.signer.verify(signedURL, intent, exportSigContext(exportID)) {
+			deny()
+			return
+		}
+		// Re-check the export row LIVE on every fetch — deliberately uncached
+		// (exports are low-volume), so revocation stops an already-issued URL on
+		// the very next download, not one cache window later.
+		assetID := assetIDFromRenditionKey(key)
+		if assetID == "" {
+			deny()
+			return
+		}
+		verdict, err := s.store.ResolveExportForDelivery(r.Context(), exportID, assetID)
+		if err != nil || !verdict.Live() {
+			deny()
+			return
+		}
+	} else if intent == string(plate.Original) {
 		// Owner front door: verified against the owner sentinel, never a grant. A
 		// grant-signed URL therefore cannot pull an original (its grantID won't be
 		// the sentinel), and this cannot pull a rendition it was not signed for.

@@ -221,6 +221,88 @@ func (p *Postgres) ResolveGrantForDelivery(ctx context.Context, grantID, assetID
 	return v, nil
 }
 
+// ── exports (Tier 1: the export capability) ─────────────────────────────────
+
+func (p *Postgres) GetExport(ctx context.Context, account, exportID string) (plate.Export, error) {
+	return scanExportRow(p.pool.QueryRow(ctx, `
+		SELECT id, account, assets, note, created, expires, revoked_at
+		FROM exports
+		WHERE account = $1 AND id = $2`, account, exportID))
+}
+
+func (p *Postgres) RevokeExport(ctx context.Context, account, exportID string) (plate.Export, error) {
+	return scanExportRow(p.pool.QueryRow(ctx, `
+		UPDATE exports
+		SET revoked_at = COALESCE(revoked_at, now())
+		WHERE account = $1 AND id = $2
+		RETURNING id, account, assets, note, created, expires, revoked_at`, account, exportID))
+}
+
+func (p *Postgres) CreateExport(ctx context.Context, account string, req plate.ExportRequest) (plate.Export, error) {
+	// Same write-side isolation check as CreateGrant: EVERY asset in the set must
+	// belong to the caller; refuse wholesale without revealing which was foreign.
+	var owned int
+	err := p.pool.QueryRow(ctx, `
+		SELECT count(*) FROM assets
+		WHERE account = $1 AND id = ANY($2)`, account, req.Assets).Scan(&owned)
+	if err != nil {
+		return plate.Export{}, err
+	}
+	if owned != len(req.Assets) {
+		return plate.Export{}, ErrForeignAsset
+	}
+
+	eid := id.New()
+	created := time.Now().UTC()
+	return scanExportRow(p.pool.QueryRow(ctx, `
+		INSERT INTO exports (id, account, assets, note, created, expires)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, account, assets, note, created, expires, revoked_at`,
+		eid, account, req.Assets, req.Note, created, req.Expires))
+}
+
+// ResolveExportForDelivery resolves an export BY ID for the download byte edge.
+// Same one-row, one-snapshot shape as ResolveGrantForDelivery (see that doc for
+// why it is deliberately not account-scoped) — but it runs on EVERY fetch with
+// no cache in front, so a revocation is effective on the very next download.
+func (p *Postgres) ResolveExportForDelivery(ctx context.Context, exportID, assetID string) (ExportVerdict, error) {
+	var v ExportVerdict
+	v.Found = true
+	err := p.pool.QueryRow(ctx, `
+		SELECT account,
+		       $2 = ANY(assets)          AS covers,
+		       revoked_at IS NOT NULL    AS revoked,
+		       expires <= now()          AS expired
+		FROM exports
+		WHERE id = $1`, exportID, assetID).
+		Scan(&v.Account, &v.Covers, &v.Revoked, &v.Expired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ExportVerdict{Found: false}, nil
+	}
+	if err != nil {
+		return ExportVerdict{}, err
+	}
+	return v, nil
+}
+
+func scanExportRow(row pgx.Row) (plate.Export, error) {
+	var (
+		e         plate.Export
+		note      *string
+		revokedAt *time.Time
+	)
+	err := row.Scan(&e.Id, &e.Account, &e.Assets, &note, &e.Created, &e.Expires, &revokedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return plate.Export{}, ErrNotFound
+	}
+	if err != nil {
+		return plate.Export{}, err
+	}
+	e.Note = note
+	e.RevokedAt = revokedAt
+	return e, nil
+}
+
 // CreateAccount provisions an account row — the CONTROL-PLANE operation that must
 // happen before an account can own uploads (uploads.account REFERENCES
 // accounts.id, so a token whose account has no row 409s at first upload). It is

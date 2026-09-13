@@ -39,12 +39,13 @@ const (
 	ScopeAssetsWrite        Scope = "assets:write"
 	ScopeRenditionsGenerate Scope = "renditions:generate"
 	ScopeGrantsManage       Scope = "grants:manage"
+	ScopeAssetsExport       Scope = "assets:export"
 )
 
 // AllScopes is the full set — a maximally-privileged token. A denial that holds
 // for THIS actor is a true account-isolation denial, not an accident of scope.
 func AllScopes() []Scope {
-	return []Scope{ScopeAssetsRead, ScopeAssetsWrite, ScopeRenditionsGenerate, ScopeGrantsManage}
+	return []Scope{ScopeAssetsRead, ScopeAssetsWrite, ScopeRenditionsGenerate, ScopeGrantsManage, ScopeAssetsExport}
 }
 
 // Actor identifies a caller by the account claim inside its (real, in
@@ -75,6 +76,7 @@ const (
 	ResourceJob
 	ResourceGrant
 	ResourceUpload
+	ResourceExport
 )
 
 // ConformanceResponse is the shape an endpoint call returns: the HTTP status and
@@ -127,6 +129,9 @@ const (
 	EpCreateGrant        EndpointID = "createGrant"
 	EpGetGrant           EndpointID = "getGrant"
 	EpRevokeGrant        EndpointID = "revokeGrant"
+	EpCreateExport       EndpointID = "createExport"
+	EpGetExport          EndpointID = "getExport"
+	EpRevokeExport       EndpointID = "revokeExport"
 )
 
 // AccountScopedService is what the real service implements to be conformance-
@@ -185,6 +190,9 @@ func AllAccountScopedEndpoints() []EndpointID {
 		EpCreateGrant, // grant over B's assets must be refused
 		EpGetGrant,
 		EpRevokeGrant,
+		EpCreateExport, // export over B's assets must be refused
+		EpGetExport,
+		EpRevokeExport,
 	}
 }
 
@@ -202,6 +210,9 @@ var endpointShapes = map[EndpointID]IsolationShape{
 	EpCreateGrant:        ShapeDenyTarget,
 	EpGetGrant:           ShapeDenyTarget,
 	EpRevokeGrant:        ShapeDenyTarget,
+	EpCreateExport:       ShapeDenyTarget,
+	EpGetExport:          ShapeDenyTarget,
+	EpRevokeExport:       ShapeDenyTarget,
 }
 
 // ShapeOf returns an endpoint's isolation shape, defaulting to ShapeDenyTarget

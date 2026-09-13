@@ -37,7 +37,7 @@ type Claims struct {
 
 // HasScope reports whether the token carries a given scope. Scopes are
 // first-class from day one (spec Q3): assets:read, assets:write,
-// renditions:generate, grants:manage.
+// renditions:generate, grants:manage, assets:export.
 func (c Claims) HasScope(s string) bool {
 	for _, have := range c.Scope {
 		if have == s {

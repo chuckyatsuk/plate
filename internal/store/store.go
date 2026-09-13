@@ -86,6 +86,27 @@ type Store interface {
 	// finalizeUpload) before doing their work.
 	AssetOwnedBy(ctx context.Context, account, assetID string) (bool, error)
 
+	// ── exports (Tier 1: the export capability) ─────────────────────────────
+
+	// GetExport returns an export if it belongs to account; otherwise ErrNotFound.
+	GetExport(ctx context.Context, account, exportID string) (plate.Export, error)
+
+	// RevokeExport revokes an owned export; ErrNotFound if not owned.
+	RevokeExport(ctx context.Context, account, exportID string) (plate.Export, error)
+
+	// CreateExport creates an export over a set of assets. Like CreateGrant, it
+	// verifies EVERY asset in the set belongs to account; any foreign asset →
+	// ErrForeignAsset (no partial export, no leak of which asset was foreign).
+	CreateExport(ctx context.Context, account string, req plate.ExportRequest) (plate.Export, error)
+
+	// ResolveExportForDelivery looks an export up BY EXPORT ID ALONE for the
+	// download byte edge — the same deliberate exception to account-scoping as
+	// ResolveGrantForDelivery, for the same reason: the signed URL is the
+	// capability, and the fetcher holds no token. Unlike grants it is called on
+	// every fetch with NO cache (exports are low-volume), so revocation is
+	// immediate. Returns only a verdict + the export's own account.
+	ResolveExportForDelivery(ctx context.Context, exportID, assetID string) (ExportVerdict, error)
+
 	// ── write path (Phase 2) ────────────────────────────────────────────────
 
 	// CreateUpload records a brokered upload the caller is about to PUT (spec
@@ -133,6 +154,25 @@ type GrantVerdict struct {
 // Live reports whether the grant may serve delivery right now: it must exist,
 // cover the asset, and be neither revoked nor expired.
 func (v GrantVerdict) Live() bool {
+	return v.Found && v.Covers && !v.Revoked && !v.Expired
+}
+
+// ExportVerdict is the outcome of resolving an export at the download edge. It
+// mirrors GrantVerdict deliberately (same fields, same leak-safe collapse at the
+// handler) but is its own type: a grant and an export are different capabilities
+// with different lifetimes, and sharing the type would invite passing one where
+// the other is meant.
+type ExportVerdict struct {
+	Found   bool   // an export with this id exists
+	Covers  bool   // the export's frozen set includes assetID
+	Revoked bool   // revoked_at is set
+	Expired bool   // expires <= now
+	Account string // the export's own account (empty if !Found)
+}
+
+// Live reports whether the export may serve a download right now: it must
+// exist, cover the asset, and be neither revoked nor expired.
+func (v ExportVerdict) Live() bool {
 	return v.Found && v.Covers && !v.Revoked && !v.Expired
 }
 

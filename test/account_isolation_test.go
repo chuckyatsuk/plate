@@ -38,6 +38,7 @@ const (
 	bAssetID     = "01BBBBBBBBBBBBBBBBBBBBBBBB"
 	bJobID       = "01BBBBBBBBBBBBBBBBBBBBJOB0"
 	bGrantID     = "01BBBBBBBBBBBBBBBBBBBGRANT"
+	bExportID    = "01BBBBBBBBBBBBBBBBBBEXPORT"
 	bKeySentinel = "acct-b/01BBBBBBBBBBBBBBBBBBBBBBBB" // B's {account}/{asset-id} storage key
 
 	// A's own asset. The enumeration assertion (listAssets) checks BOTH
@@ -59,6 +60,8 @@ func targetFor(ep support.EndpointID) support.Resource {
 		return support.Resource{Kind: support.ResourceJob, ID: bJobID, Owner: accountB}
 	case support.EpGetGrant, support.EpRevokeGrant:
 		return support.Resource{Kind: support.ResourceGrant, ID: bGrantID, Owner: accountB}
+	case support.EpGetExport, support.EpRevokeExport:
+		return support.Resource{Kind: support.ResourceExport, ID: bExportID, Owner: accountB}
 	default:
 		// All the asset-scoped endpoints (delivery, getAsset, deleteAsset,
 		// listAssets, requestRendition, finalizeUpload, createGrant-over-B's-assets)
@@ -92,7 +95,7 @@ func TestAccountIsolation_EveryEndpoint_DeniesCrossAccount(t *testing.T) {
 				}
 				// The leak that actually happens on a list endpoint: a query that
 				// forgot `WHERE account = $claim` and returned B's rows too.
-				if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID) {
+				if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID, bExportID) {
 					t.Fatalf("%s: account A's listing contained account B's data (status %d) — the result set was not scoped to the caller (a missing `WHERE account = $claim`). Body: %q", ep, resp.Status, string(resp.Body))
 				}
 				// And it must actually contain A's own asset — otherwise "no B data"
@@ -105,7 +108,7 @@ func TestAccountIsolation_EveryEndpoint_DeniesCrossAccount(t *testing.T) {
 				if !support.IsDenied(resp.Status) {
 					t.Fatalf("%s: account A reached a B-owned resource — HTTP %d, expected a denial (403/404). This is the worst bug this architecture can have: a code-enforced boundary that was not enforced on THIS endpoint (spec Q4).", ep, resp.Status)
 				}
-				if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID) {
+				if support.LeaksAccountData(resp.Body, accountB, bKeySentinel, bAssetID, bJobID, bGrantID, bExportID) {
 					t.Fatalf("%s: response to account A contained account B's data (status %d) — even a leak-safe 404 must not echo B's account, key, or ids. Body: %q", ep, resp.Status, string(resp.Body))
 				}
 			}

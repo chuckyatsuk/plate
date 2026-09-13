@@ -102,7 +102,7 @@ func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 
 	return &e2e{
 		t: t, st: st, stor: m, handler: svc.Router(), worker: w,
-		token:   signToken(t, priv, acct, "assets:read,assets:write,renditions:generate,grants:manage"),
+		token:   signToken(t, priv, acct, "assets:read,assets:write,renditions:generate,grants:manage,assets:export"),
 		account: acct,
 		priv:    priv,
 	}

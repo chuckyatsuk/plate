@@ -127,6 +127,10 @@ func runWithService(m *testing.M) int {
 			R2PublicBase:      "https://r2.example",
 			DownloadBase:      "https://plate.example",
 		},
+		// Signing configured for the same reason storage is (above): createExport
+		// fail-closes 503 without a signer, and a 503 would mask the cross-account
+		// denial this test exists to prove. The denial must be the account check.
+		DeliverySigningKey: "isolation-wiring-signing-key",
 	})
 
 	support.SetAccountScopedService(&realService{
@@ -178,6 +182,13 @@ func seedAccountsAndB(ctx context.Context, st *store.Postgres) error {
 		INSERT INTO grants (id, account, assets, expires)
 		VALUES ($1, 'acct-b', $2, now() + interval '1 day')`,
 		"01BBBBBBBBBBBBBBBBBBBGRANT", []string{"01BBBBBBBBBBBBBBBBBBBBBBBB"}); err != nil {
+		return err
+	}
+	// B's export over B's asset.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO exports (id, account, assets, expires)
+		VALUES ($1, 'acct-b', $2, now() + interval '7 days')`,
+		"01BBBBBBBBBBBBBBBBBBEXPORT", []string{"01BBBBBBBBBBBBBBBBBBBBBBBB"}); err != nil {
 		return err
 	}
 	return nil
@@ -257,6 +268,14 @@ func (rs *realService) CallCrossAccount(ep support.EndpointID, caller support.Ac
 		return rs.do("GET", "/v1/grants/"+target.ID, tok, "")
 	case support.EpRevokeGrant:
 		return rs.do("DELETE", "/v1/grants/"+target.ID, tok, "")
+	case support.EpCreateExport:
+		// An export over B's asset must be refused wholesale, like createGrant.
+		return rs.do("POST", "/v1/exports", tok,
+			`{"assets":["`+target.ID+`"],"expires":"`+farFuture()+`"}`)
+	case support.EpGetExport:
+		return rs.do("GET", "/v1/exports/"+target.ID, tok, "")
+	case support.EpRevokeExport:
+		return rs.do("DELETE", "/v1/exports/"+target.ID, tok, "")
 	default:
 		return support.ConformanceResponse{Status: http.StatusInternalServerError, Body: []byte("unmapped endpoint " + string(ep))}
 	}
