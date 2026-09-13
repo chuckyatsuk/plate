@@ -82,3 +82,16 @@ func TestKnownScopes(t *testing.T) {
 		}
 	}
 }
+
+func TestValidKidArg(t *testing.T) {
+	for _, ok := range []string{"files", "ops-2", "a_b", "A9"} {
+		if !validKidArg(ok) {
+			t.Errorf("validKidArg(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "has space", "kid=1", "läder", "x,y"} {
+		if validKidArg(bad) {
+			t.Errorf("validKidArg(%q) = true, want false", bad)
+		}
+	}
+}

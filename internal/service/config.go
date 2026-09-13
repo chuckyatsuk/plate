@@ -88,32 +88,110 @@ func LoadEnv() (EnvConfig, error) {
 			"service: DATABASE_URL points at the Supabase TRANSACTION pooler (port 6543), which lacks the session semantics SKIP LOCKED + goose DDL require — use the SESSION pooler (port 5432) instead (the direct db.<ref> host is IPv6-only)")
 	}
 
-	// The validation key is optional at boot: with no key, the process still
-	// starts and the unauthenticated health/readiness probes work (spec: those
-	// opt out with security: []), but EVERY token-bearing request is rejected
-	// 401 by a deny-all verifier — the quickstart boots, yet nothing leaks. Set
-	// PLATE_JWT_PUBLIC_KEY to actually accept tokens. This is fail-safe: absence
-	// of the key denies, never allows.
-	keyStr := os.Getenv("PLATE_JWT_PUBLIC_KEY")
-	if keyStr == "" {
+	// Validation keys are optional at boot: with none, the process still starts
+	// and the unauthenticated health/readiness probes work (spec: those opt out
+	// with security: []), but EVERY token-bearing request is rejected 401 by a
+	// deny-all verifier — the quickstart boots, yet nothing leaks. This is
+	// fail-safe: absence of keys denies, never allows.
+	//
+	// Two sources, combinable (Tier 1 credential rotation):
+	//   - PLATE_JWT_PUBLIC_KEY: the legacy single key — verifies tokens with NO
+	//     kid header (every pre-keyset token).
+	//   - PLATE_JWT_PUBLIC_KEYS: a NAMED set, "kid=base64,kid2=base64" — a token's
+	//     kid header selects exactly its key. Rotation is add → switch → retire;
+	//     retiring a kid revokes that consumer's tokens without touching others.
+	legacyStr := os.Getenv("PLATE_JWT_PUBLIC_KEY")
+	keyset, err := parseKeyset(os.Getenv("PLATE_JWT_PUBLIC_KEYS"))
+	if err != nil {
+		return EnvConfig{}, err
+	}
+	if legacyStr == "" && keyset == nil {
 		cfg.Verifier = auth.DenyAllVerifier()
 		return cfg, nil
 	}
-	// Refuse to boot on a KNOWN-THROWAWAY key (the demo/smoke keypair) unless the
-	// operator explicitly opts in with PLATE_ALLOW_THROWAWAY_KEYS=true. This keeps
-	// a demo key from silently reaching a real deployment: the demo sets the flag
-	// deliberately; prod never does, so a copied .env fails loud at boot instead of
-	// accepting tokens signed by a key whose private half is in a scratch file.
-	if isThrowawayKey(keyStr) && os.Getenv("PLATE_ALLOW_THROWAWAY_KEYS") != "true" {
-		return EnvConfig{}, errors.New(
-			"service: PLATE_JWT_PUBLIC_KEY is a KNOWN-THROWAWAY demo key — generate a real Ed25519 keypair for this deployment, or set PLATE_ALLOW_THROWAWAY_KEYS=true if this is intentionally the demo")
+	var legacy ed25519.PublicKey
+	if legacyStr != "" {
+		// Refuse to boot on a KNOWN-THROWAWAY key (the demo/smoke keypair) unless
+		// the operator explicitly opts in with PLATE_ALLOW_THROWAWAY_KEYS=true.
+		// This keeps a demo key from silently reaching a real deployment: the demo
+		// sets the flag deliberately; prod never does, so a copied .env fails loud
+		// at boot instead of accepting tokens signed by a key whose private half is
+		// in a scratch file.
+		if isThrowawayKey(legacyStr) && os.Getenv("PLATE_ALLOW_THROWAWAY_KEYS") != "true" {
+			return EnvConfig{}, errors.New(
+				"service: PLATE_JWT_PUBLIC_KEY is a KNOWN-THROWAWAY demo key — generate a real Ed25519 keypair for this deployment, or set PLATE_ALLOW_THROWAWAY_KEYS=true if this is intentionally the demo")
+		}
+		legacy, err = loadEd25519Public(legacyStr)
+		if err != nil {
+			return EnvConfig{}, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEY: %w", err)
+		}
 	}
-	pub, err := loadEd25519Public(keyStr)
-	if err != nil {
-		return EnvConfig{}, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEY: %w", err)
-	}
-	cfg.Verifier = auth.NewVerifier(pub, os.Getenv("PLATE_JWT_ISSUER"), os.Getenv("PLATE_JWT_AUDIENCE"))
+	cfg.Verifier = auth.NewKeysetVerifier(legacy, keyset, os.Getenv("PLATE_JWT_ISSUER"), os.Getenv("PLATE_JWT_AUDIENCE"))
 	return cfg, nil
+}
+
+// parseKeyset parses PLATE_JWT_PUBLIC_KEYS: comma-separated `kid=base64` pairs,
+// e.g. "files=SEy/Ys...,ops=9SRBsq...". Returns nil for an empty/unset value.
+// Every entry is validated hard — a malformed pair, empty half, duplicate kid,
+// or throwaway-class key refuses BOOT, never a silently-untrusted key (the
+// looks-configured-but-isn't trap this project keeps meeting: the empty Fly
+// secret that read as "Deployed" while the server fail-closed at first use).
+func parseKeyset(s string) (map[string]ed25519.PublicKey, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	keys := make(map[string]ed25519.PublicKey)
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue // tolerate a trailing comma
+		}
+		kid, val, found := strings.Cut(entry, "=")
+		// A base64 value may itself end in '='; Cut on the FIRST '=' keeps the
+		// padding with the value. The kid half must not be empty and must be a
+		// plain name (it travels in a JWT header and in ops runbooks).
+		kid = strings.TrimSpace(kid)
+		val = strings.TrimSpace(val)
+		if !found || kid == "" || val == "" {
+			return nil, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEYS entry %q is not kid=base64key", entry)
+		}
+		if !validKid(kid) {
+			return nil, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEYS kid %q must be [A-Za-z0-9_-]{1,64}", kid)
+		}
+		if _, dup := keys[kid]; dup {
+			return nil, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEYS names kid %q twice — one of them is not the key you think it is", kid)
+		}
+		if isThrowawayKey(val) && os.Getenv("PLATE_ALLOW_THROWAWAY_KEYS") != "true" {
+			return nil, fmt.Errorf(
+				"service: PLATE_JWT_PUBLIC_KEYS kid %q is a KNOWN-THROWAWAY demo key — generate a real Ed25519 keypair, or set PLATE_ALLOW_THROWAWAY_KEYS=true if this is intentionally the demo", kid)
+		}
+		pub, err := loadEd25519Public(val)
+		if err != nil {
+			return nil, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEYS kid %q: %w", kid, err)
+		}
+		keys[kid] = pub
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("service: PLATE_JWT_PUBLIC_KEYS is set but contains no kid=key entries")
+	}
+	return keys, nil
+}
+
+// validKid bounds key ids to plain names: they travel in JWT headers, env vars,
+// and runbook prose, so no separators/whitespace that could corrupt parsing.
+func validKid(kid string) bool {
+	if len(kid) == 0 || len(kid) > 64 {
+		return false
+	}
+	for _, r := range kid {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // knownThrowawayKeys are public keys minted as demo/smoke throwaways this project
