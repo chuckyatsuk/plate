@@ -360,6 +360,62 @@ type Error struct {
 	Message string `json:"message"`
 }
 
+// Export A long-lived, revocable owner capability over a frozen set of assets,
+// yielding download URLs for their ORIGINAL bytes. The record is the
+// capability: every download fetch re-checks it live, so revocation is
+// immediate at the byte edge.
+type Export struct {
+	// Account Opaque foreign reference (spec Q2). Plate stores an id plus storage
+	// config — NO users, roles, or permissions. Identity is a separate concern.
+	Account AccountId `json:"account"`
+	Assets  []AssetId `json:"assets"`
+	Created time.Time `json:"created"`
+
+	// Downloads Per-asset signed download URLs for the ORIGINAL bytes. Present only
+	// while the export is live (not revoked, not expired) and download
+	// signing is configured — re-derived on every read, never stored, so a
+	// dead export cannot hand them out.
+	Downloads *[]ExportDownload `json:"downloads,omitempty"`
+	Expires   time.Time         `json:"expires"`
+	Id        ExportId          `json:"id"`
+
+	// Note Optional opaque label, or null.
+	Note *string `json:"note,omitempty"`
+
+	// RevokedAt When the export was revoked, or null if active.
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+}
+
+// ExportDownload defines model for ExportDownload.
+type ExportDownload struct {
+	// Asset Service-generated. ULID or content hash.
+	//
+	// Examples: 01J9Z0K3Q4XR7NB8YF2WV6TCEH
+	Asset AssetId `json:"asset"`
+
+	// Expires Same as the export's expiry — the URL's signature dies with the export.
+	Expires time.Time `json:"expires"`
+
+	// Url A signed Plate download URL for the asset's original bytes. Liveness-checked on every fetch.
+	Url string `json:"url"`
+}
+
+// ExportId defines model for ExportId.
+type ExportId = string
+
+// ExportRequest Create an export over a frozen SET of assets.
+type ExportRequest struct {
+	// Assets The SET this export covers, frozen at issue time.
+	Assets []AssetId `json:"assets"`
+
+	// Expires When the export's download URLs stop working. Must be in the future
+	// and at most 30 days out (the hard cap) — long-lived, never unbounded.
+	Expires time.Time `json:"expires"`
+
+	// Note Optional opaque label recording what this export is for. Plate does not interpret it.
+	Note *string `json:"note,omitempty"`
+}
+
 // FinalizeRequest Signal a successful PUT so Plate can checksum, probe, and register the vault object.
 type FinalizeRequest struct {
 	// Checksum Client-computed checksum to verify against the stored object (e.g. sha256:...).
@@ -583,6 +639,9 @@ type AssetIdPath = AssetId
 // CursorQuery defines model for CursorQuery.
 type CursorQuery = string
 
+// ExportIdPath defines model for ExportIdPath.
+type ExportIdPath = ExportId
+
 // GrantIdPath defines model for GrantIdPath.
 type GrantIdPath = GrantId
 
@@ -629,6 +688,9 @@ type ResolveDeliveryUrlParams struct {
 
 // RequestRenditionJSONRequestBody defines body for RequestRendition for application/json ContentType.
 type RequestRenditionJSONRequestBody = RenditionRequest
+
+// CreateExportJSONRequestBody defines body for CreateExport for application/json ContentType.
+type CreateExportJSONRequestBody = ExportRequest
 
 // CreateGrantJSONRequestBody defines body for CreateGrant for application/json ContentType.
 type CreateGrantJSONRequestBody = GrantRequest

@@ -40,6 +40,9 @@ func (s *Service) Router() http.Handler {
 	api.HandleFunc("POST /v1/grants", s.handleCreateGrant)
 	api.HandleFunc("GET /v1/grants/{grantId}", s.handleGetGrant)
 	api.HandleFunc("DELETE /v1/grants/{grantId}", s.handleRevokeGrant)
+	api.HandleFunc("POST /v1/exports", s.handleCreateExport)
+	api.HandleFunc("GET /v1/exports/{exportId}", s.handleGetExport)
+	api.HandleFunc("DELETE /v1/exports/{exportId}", s.handleRevokeExport)
 
 	mux.Handle("/v1/", s.verf.Middleware(api))
 	return mux

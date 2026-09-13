@@ -119,6 +119,7 @@ var knownScopes = map[string]bool{
 	"assets:write":        true,
 	"renditions:generate": true,
 	"grants:manage":       true,
+	"assets:export":       true,
 }
 
 // mintToken is the operator subcommand that issues a scoped service token:
@@ -140,7 +141,7 @@ var knownScopes = map[string]bool{
 // beyond a throwaway smoke.
 func mintToken() error {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
-	scopesCSV := fs.String("scopes", "", "comma-separated scopes (assets:read,assets:write,renditions:generate,grants:manage)")
+	scopesCSV := fs.String("scopes", "", "comma-separated scopes (assets:read,assets:write,renditions:generate,grants:manage,assets:export)")
 	ttlStr := fs.String("ttl", "720h", "token lifetime, e.g. 90d, 720h, 30m (bounded; the token always expires)")
 	sub := fs.String("sub", "operator", "the token's subject claim (a label for who/what it is for)")
 	// os.Args: plate token <account> [flags]
@@ -162,7 +163,7 @@ func mintToken() error {
 	}
 	for _, s := range scopes {
 		if !knownScopes[s] {
-			return fmt.Errorf("unknown scope %q (known: assets:read, assets:write, renditions:generate, grants:manage)", s)
+			return fmt.Errorf("unknown scope %q (known: assets:read, assets:write, renditions:generate, grants:manage, assets:export)", s)
 		}
 	}
 

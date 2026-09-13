@@ -67,6 +67,8 @@ tags:
     description: Request derivative generation; observe job state.
   - name: grants
     description: First-class access records for share links, packages, consignments.
+  - name: exports
+    description: Long-lived, revocable owner capabilities for original bytes (archives, manifests).
   - name: system
     description: Health and readiness.
 
@@ -486,6 +488,107 @@ paths:
           $ref: '#/components/responses/NotFound'
 
   # ───────────────────────────────────────────────────────────────────────────
+  # Exports — long-lived, revocable owner capabilities for original bytes
+  # ───────────────────────────────────────────────────────────────────────────
+  /exports:
+    post:
+      tags: [exports]
+      operationId: createExport
+      summary: Create an export — long-TTL download URLs for a set of originals.
+      description: |
+        An export is the OWNER's long-lived counterpart to a grant: a first-class,
+        revocable record over a frozen SET of assets that yields download URLs for
+        their **original** bytes (an archive, a media manifest, a handover). It
+        exists so a consumer's long-lived export links have a Plate-native shape
+        instead of reaching around Plate to storage directly.
+
+        Three properties distinguish it from the other byte routes:
+        - **Owner-auth, own scope.** Requires `assets:export`; a grant can never
+          mint one, and an export URL can never serve a non-original rendition.
+        - **Long TTL, hard cap.** `expires` may be up to 30 days out — a refused
+          request (past the cap, or not in the future) is a `400`, so "long-lived"
+          can never quietly mean "forever".
+        - **Revocable at the byte edge, immediately.** Each download URL is a
+          signed Plate `/v1/download` capability; every fetch re-checks the export
+          row live (no cache — exports are low-volume, unlike granted tiles), so
+          revocation stops even an already-issued URL on the next fetch. The
+          storage-presigned hop behind the redirect stays seconds-short.
+
+        The set is frozen at issue time, like a grant: adding an asset later is a
+        new export.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+      responses:
+        '201':
+          description: The export, including its per-asset download URLs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /exports/{exportId}:
+    get:
+      tags: [exports]
+      operationId: getExport
+      summary: Get an export, re-deriving its download URLs while it is live.
+      description: |
+        Returns the export record. `downloads` is present only while the export
+        is live (not revoked, not expired) — the URLs are re-derived, not stored,
+        so reading an export never resurrects a dead capability.
+      parameters:
+        - $ref: '#/components/parameters/ExportIdPath'
+      responses:
+        '200':
+          description: The export.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [exports]
+      operationId: revokeExport
+      summary: Revoke an export.
+      description: |
+        One row, one revocation — every download URL the export ever produced
+        stops resolving on its next fetch. Unlike grant revocation (eventually-
+        consistent within a cache window), export revocation is checked live on
+        every download, so it is immediate at the byte edge; only an already
+        in-flight transfer completes.
+      parameters:
+        - $ref: '#/components/parameters/ExportIdPath'
+      responses:
+        '200':
+          description: The revoked export (revoked_at set, downloads absent).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Export'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────────────────────────────────────────────────────────
   # System — twelve-factor / K8s-ready (spec Q4)
   # ───────────────────────────────────────────────────────────────────────────
   /healthz:
@@ -535,8 +638,8 @@ components:
         `exp`, plus `account` and `scope`. **The `account` claim is the only
         source of the caller's account** — never a request parameter. Scopes are
         first-class: `assets:read`, `assets:write`, `renditions:generate`,
-        `grants:manage`. Issuance is separable from validation (OAuth-shaped,
-        not OAuth-implemented).
+        `grants:manage`, `assets:export`. Issuance is separable from validation
+        (OAuth-shaped, not OAuth-implemented).
 
   parameters:
     AssetIdPath:
@@ -552,6 +655,12 @@ components:
       required: true
       schema:
         $ref: '#/components/schemas/GrantId'
+    ExportIdPath:
+      name: exportId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ExportId'
     CursorQuery:
       name: cursor
       in: query
@@ -609,6 +718,9 @@ components:
       pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
       examples: ['01J9Z0K3Q4XR7NB8YF2WV6TCEH']
     GrantId:
+      type: string
+      pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
+    ExportId:
       type: string
       pattern: '^[0-9A-Za-z][0-9A-Za-z_-]{1,127}$'
     JobId:
@@ -704,7 +816,7 @@ components:
 
     Scope:
       type: string
-      enum: [assets:read, assets:write, renditions:generate, grants:manage]
+      enum: [assets:read, assets:write, renditions:generate, grants:manage, assets:export]
 
     # ── Delivery ─────────────────────────────────────────────────────────────
     DeliveryResolution:
@@ -1119,6 +1231,93 @@ components:
           $ref: '#/components/schemas/AssetId'
         intent:
           $ref: '#/components/schemas/Intent'
+
+    # ── Exports ──────────────────────────────────────────────────────────────
+    ExportRequest:
+      type: object
+      additionalProperties: false
+      description: Create an export over a frozen SET of assets.
+      required: [assets, expires]
+      properties:
+        assets:
+          type: array
+          description: The SET this export covers, frozen at issue time.
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/AssetId'
+        note:
+          type: string
+          description: Optional opaque label recording what this export is for. Plate does not interpret it.
+          maxLength: 255
+        expires:
+          type: string
+          format: date-time
+          description: |
+            When the export's download URLs stop working. Must be in the future
+            and at most 30 days out (the hard cap) — long-lived, never unbounded.
+
+    Export:
+      type: object
+      additionalProperties: false
+      description: |
+        A long-lived, revocable owner capability over a frozen set of assets,
+        yielding download URLs for their ORIGINAL bytes. The record is the
+        capability: every download fetch re-checks it live, so revocation is
+        immediate at the byte edge.
+      required: [id, account, assets, created, expires]
+      properties:
+        id:
+          $ref: '#/components/schemas/ExportId'
+        account:
+          $ref: '#/components/schemas/AccountId'
+        assets:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/AssetId'
+        note:
+          description: Optional opaque label, or null.
+          oneOf:
+            - type: string
+              maxLength: 255
+            - type: 'null'
+        created:
+          type: string
+          format: date-time
+        expires:
+          type: string
+          format: date-time
+        revoked_at:
+          description: When the export was revoked, or null if active.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+        downloads:
+          type: array
+          description: |
+            Per-asset signed download URLs for the ORIGINAL bytes. Present only
+            while the export is live (not revoked, not expired) and download
+            signing is configured — re-derived on every read, never stored, so a
+            dead export cannot hand them out.
+          items:
+            $ref: '#/components/schemas/ExportDownload'
+
+    ExportDownload:
+      type: object
+      additionalProperties: false
+      required: [asset, url, expires]
+      properties:
+        asset:
+          $ref: '#/components/schemas/AssetId'
+        url:
+          type: string
+          format: uri
+          description: A signed Plate download URL for the asset's original bytes. Liveness-checked on every fetch.
+        expires:
+          type: string
+          format: date-time
+          description: Same as the export's expiry — the URL's signature dies with the export.
 
     # ── System & errors ──────────────────────────────────────────────────────
     Health:

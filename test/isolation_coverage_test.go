@@ -126,6 +126,7 @@ func TestIsolationCoverage_OnlyProbesAreUnsecured(t *testing.T) {
 		"resolveDeliveryUrl", "getAsset", "deleteAsset", "listAssets",
 		"requestRendition", "getJob", "createUpload", "finalizeUpload",
 		"createGrant", "getGrant", "revokeGrant",
+		"createExport", "getExport", "revokeExport",
 	}
 	for _, op := range allOps {
 		if !secured[op] {
