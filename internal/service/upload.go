@@ -103,9 +103,16 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // imageProbePrefixBytes is how much of an object's head the image probe reads via
-// a ranged GET — enough for JPEG/PNG/GIF headers, so a 300MB TIFF is never fully
-// downloaded into the request (review ruling 1).
-const imageProbePrefixBytes = 64 * 1024
+// a ranged GET, so a 300MB TIFF is never fully downloaded into the request
+// (review ruling 1). It must cover everything BEFORE a JPEG's SOF marker, and
+// real art-documentation files put serious metadata there: Photoshop-saved
+// JPEGs carry APP1 XMP (a single segment maxes at 64KiB, and chunked
+// ExtendedXMP can stack several) plus APP13 IPTC/preview blocks — the demo
+// backfill (2026-09-13) hit five real files with SOF at 86–111KiB, which a
+// 64KiB window refused as "unprobeable". 1MiB covers stacked-metadata files
+// with room to spare while remaining a trivially bounded single ranged read —
+// the point of the constant is bounding the request, not starving the parser.
+const imageProbePrefixBytes = 1024 * 1024
 
 // handleFinalizeUpload registers the vault object after a successful PUT (spec
 // §5.1, §5.3 refined per review ruling 1). Fail-closed means the vault never
