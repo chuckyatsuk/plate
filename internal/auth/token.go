@@ -47,11 +47,23 @@ func (c Claims) HasScope(s string) bool {
 	return false
 }
 
-// Verifier validates incoming service tokens against an Ed25519 public key and
-// the expected issuer/audience. It only VALIDATES — it never mints — so the
-// service half holds no signing key (spec Q3, issuance separable from validation).
+// Verifier validates incoming service tokens against a SET of trusted Ed25519
+// public keys and the expected issuer/audience. It only VALIDATES — it never
+// mints — so the service half holds no signing key (spec Q3, issuance separable
+// from validation).
+//
+// The key set is what makes credential ROTATION and REVOCATION real (Tier 1):
+// a token names its key via the standard `kid` header, and the verifier selects
+// exactly that key. Rotation is then three independent, reversible steps —
+// trust a new kid, switch the consumer to it, retire the old kid — with an
+// overlap window instead of an all-or-nothing key swap; revoking a consumer's
+// credential is retiring its kid, which kills only THAT consumer's tokens.
+// A token with NO kid verifies against the legacy single key (the shape every
+// pre-keyset token has), so adding the key set changes nothing until named
+// keys are actually configured.
 type Verifier struct {
-	pub      ed25519.PublicKey
+	pub      ed25519.PublicKey            // legacy key: verifies tokens with NO kid header
+	keys     map[string]ed25519.PublicKey // named keys: a token's kid selects exactly one
 	issuer   string
 	audience string
 	parser   *jwt.Parser
@@ -65,10 +77,20 @@ func DenyAllVerifier() *Verifier {
 	return &Verifier{parser: jwt.NewParser()}
 }
 
-// NewVerifier builds a Verifier. issuer/audience may be empty to skip that check
-// (useful in tests), but in production both are set from PLATE_JWT_ISSUER /
-// PLATE_JWT_AUDIENCE.
+// NewVerifier builds a single-key Verifier (the legacy shape: tokens carry no
+// kid). issuer/audience may be empty to skip that check (useful in tests), but
+// in production both are set from PLATE_JWT_ISSUER / PLATE_JWT_AUDIENCE.
 func NewVerifier(pub ed25519.PublicKey, issuer, audience string) *Verifier {
+	return NewKeysetVerifier(pub, nil, issuer, audience)
+}
+
+// NewKeysetVerifier builds a Verifier trusting a legacy no-kid key (may be nil)
+// plus a set of named keys selected by the token's `kid` header (may be empty).
+// Selection is strict in both directions — a kid-bearing token NEVER falls back
+// to the legacy key (a retired kid must not resurrect through fallback), and a
+// no-kid token never tries the named keys (its issuer predates them) — so
+// retiring a kid is a real revocation, not a suggestion.
+func NewKeysetVerifier(legacy ed25519.PublicKey, keys map[string]ed25519.PublicKey, issuer, audience string) *Verifier {
 	opts := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{"EdDSA"}), // reject alg confusion outright
 	}
@@ -78,7 +100,24 @@ func NewVerifier(pub ed25519.PublicKey, issuer, audience string) *Verifier {
 	if audience != "" {
 		opts = append(opts, jwt.WithAudience(audience))
 	}
-	return &Verifier{pub: pub, issuer: issuer, audience: audience, parser: jwt.NewParser(opts...)}
+	// Copy the map so a caller mutating theirs later cannot silently change the
+	// trusted set of a running verifier.
+	var ks map[string]ed25519.PublicKey
+	if len(keys) > 0 {
+		ks = make(map[string]ed25519.PublicKey, len(keys))
+		for kid, k := range keys {
+			ks[kid] = k
+		}
+	}
+	return &Verifier{pub: legacy, keys: ks, issuer: issuer, audience: audience, parser: jwt.NewParser(opts...)}
+}
+
+// Configured reports whether the verifier trusts ANY key. False means deny-all:
+// the process serves probes but 401s every token. Exposed so boot can WARN
+// loudly about a deployment that looks up but can never authenticate — the
+// quiet cousin of the empty-secret trap.
+func (v *Verifier) Configured() bool {
+	return v.pub != nil || len(v.keys) > 0
 }
 
 // ErrNoAccount is returned when a token validates structurally but carries no
@@ -95,6 +134,19 @@ func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 			return nil, fmt.Errorf("auth: unexpected signing method %q", t.Header["alg"])
 		}
+		// Key selection (see the Verifier doc): a kid selects exactly one named
+		// key — unknown or retired kids fail, with NO legacy fallback (fallback
+		// would resurrect a revoked credential); no kid means the legacy key.
+		if kid, ok := t.Header["kid"].(string); ok && kid != "" {
+			key, known := v.keys[kid]
+			if !known {
+				return nil, fmt.Errorf("auth: unknown key id %q", kid)
+			}
+			return key, nil
+		}
+		if v.pub == nil {
+			return nil, errors.New("auth: token has no key id and no legacy key is configured")
+		}
 		return v.pub, nil
 	})
 	if err != nil {
@@ -108,9 +160,22 @@ func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 
 // Sign mints a token for the given claims using an Ed25519 private key. This is
 // the issuer half — used by tests and by a future authorization server, kept
-// beside Verify so the claim shape cannot drift between the two.
+// beside Verify so the claim shape cannot drift between the two. A token signed
+// here carries no kid and verifies against the LEGACY key only.
 func Sign(priv ed25519.PrivateKey, c Claims) (string, error) {
 	t := jwt.NewWithClaims(jwt.SigningMethodEdDSA, c)
+	return t.SignedString(priv)
+}
+
+// SignWithKid mints a token naming its key via the standard `kid` header, so a
+// keyset verifier selects exactly that key. This is the mint half of rotation:
+// a consumer's tokens carry its kid, and retiring that kid revokes them.
+func SignWithKid(priv ed25519.PrivateKey, kid string, c Claims) (string, error) {
+	if kid == "" {
+		return "", errors.New("auth: kid must not be empty (use Sign for a legacy no-kid token)")
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodEdDSA, c)
+	t.Header["kid"] = kid
 	return t.SignedString(priv)
 }
 

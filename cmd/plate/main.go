@@ -32,7 +32,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: plate <serve|work|accounts|token|imgproxy-presets>")
+		fmt.Fprintln(os.Stderr, "usage: plate <serve|work|accounts|token|keypair|imgproxy-presets>")
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)) // structured logs to stdout (twelve-factor)
@@ -64,8 +64,13 @@ func main() {
 			log.Error("token failed", "err", err)
 			os.Exit(1)
 		}
+	case "keypair":
+		if err := genKeypair(); err != nil {
+			log.Error("keypair failed", "err", err)
+			os.Exit(1)
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work|accounts|token|imgproxy-presets)\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work|accounts|token|keypair|imgproxy-presets)\n", os.Args[1])
 		os.Exit(2)
 	}
 }
@@ -144,9 +149,10 @@ func mintToken() error {
 	scopesCSV := fs.String("scopes", "", "comma-separated scopes (assets:read,assets:write,renditions:generate,grants:manage,assets:export)")
 	ttlStr := fs.String("ttl", "720h", "token lifetime, e.g. 90d, 720h, 30m (bounded; the token always expires)")
 	sub := fs.String("sub", "operator", "the token's subject claim (a label for who/what it is for)")
+	kid := fs.String("kid", "", "key id: names the signing key in the token's kid header, so the server verifies it against PLATE_JWT_PUBLIC_KEYS[kid] — retiring that kid revokes the token. Empty mints a legacy no-kid token (verified by PLATE_JWT_PUBLIC_KEY).")
 	// os.Args: plate token <account> [flags]
 	if len(os.Args) < 3 {
-		return fmt.Errorf("usage: plate token <account> --scopes s1,s2 [--ttl 90d] [--sub label]")
+		return fmt.Errorf("usage: plate token <account> --scopes s1,s2 [--ttl 90d] [--sub label] [--kid name]")
 	}
 	account := os.Args[2]
 	if account == "" || strings.HasPrefix(account, "-") {
@@ -189,7 +195,7 @@ func mintToken() error {
 	priv := ed25519.PrivateKey(raw)
 
 	now := time.Now()
-	tok, err := auth.Sign(priv, auth.Claims{
+	claims := auth.Claims{
 		Account: account,
 		Scope:   scopes,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -197,7 +203,19 @@ func mintToken() error {
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
-	})
+	}
+	var tok string
+	if *kid != "" {
+		// A kid names the key — mint-side validation mirrors the server's boot
+		// check (PLATE_JWT_PUBLIC_KEYS parsing), so we cannot mint a token whose
+		// kid the server could never have configured.
+		if !validKidArg(*kid) {
+			return fmt.Errorf("--kid %q must be [A-Za-z0-9_-]{1,64}", *kid)
+		}
+		tok, err = auth.SignWithKid(priv, *kid, claims)
+	} else {
+		tok, err = auth.Sign(priv, claims)
+	}
 	if err != nil {
 		return err
 	}
@@ -208,9 +226,51 @@ func mintToken() error {
 	// human-readable summary goes explicitly to STDERR instead. No secret in the
 	// summary — just its shape.
 	fmt.Println(tok)
-	fmt.Fprintf(os.Stderr, "token minted: account=%s scopes=%s sub=%s expires=%s (ttl %s)\n",
-		account, strings.Join(scopes, ","), *sub,
+	kidNote := *kid
+	if kidNote == "" {
+		kidNote = "(none — legacy key)"
+	}
+	fmt.Fprintf(os.Stderr, "token minted: account=%s scopes=%s sub=%s kid=%s expires=%s (ttl %s)\n",
+		account, strings.Join(scopes, ","), *sub, kidNote,
 		now.Add(ttl).UTC().Format(time.RFC3339), ttl.String())
+	return nil
+}
+
+// validKidArg mirrors the server's kid rule (internal/service parseKeyset):
+// plain [A-Za-z0-9_-]{1,64} names only, so a minted kid is always one the
+// server's PLATE_JWT_PUBLIC_KEYS parser would accept.
+func validKidArg(kid string) bool {
+	if len(kid) == 0 || len(kid) > 64 {
+		return false
+	}
+	for _, r := range kid {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// genKeypair generates a fresh Ed25519 keypair for the credential model: the
+// PUBLIC half goes into the server's trusted set (PLATE_JWT_PUBLIC_KEYS as
+// `<kid>=<public>`, or legacy PLATE_JWT_PUBLIC_KEY), the PRIVATE half is the
+// consumer/operator-held signing key (PLATE_JWT_PRIVATE_B64 for `plate token`).
+// Promoted from the .scratch smoketool so key generation is a first-class,
+// documented operator step instead of a scratch script.
+//
+// Output shape follows `plate token`: machine-readable halves on STDOUT (two
+// labeled lines, stable format), guidance on STDERR. The private half is a
+// SECRET — capture it straight into a secret store or env file, never a repo.
+func genKeypair() error {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("public=%s\n", base64.StdEncoding.EncodeToString(pub))
+	fmt.Printf("private=%s\n", base64.StdEncoding.EncodeToString(priv))
+	fmt.Fprintln(os.Stderr, "keypair generated. public → the server's trusted set (PLATE_JWT_PUBLIC_KEYS entry `<kid>=<public>`, or PLATE_JWT_PUBLIC_KEY); private → the issuer's PLATE_JWT_PRIVATE_B64. The private half is a SECRET — store it in a secret manager or a gitignored env file, never a repo.")
 	return nil
 }
 
@@ -276,6 +336,17 @@ func serve(log *slog.Logger) error {
 		log.Info("write path enabled (storage configured)")
 	} else {
 		log.Info("read-path-only (no storage configured; write endpoints return 503)")
+	}
+
+	// Loud-at-boot for the looks-configured-but-isn't traps (the empty Fly
+	// secret, 2026-09-13): these states are LEGAL (the quickstart .env.example
+	// ships them empty) but must never be silent — the failure otherwise
+	// surfaces as a bare 503/401 at first use, far from its cause.
+	if !cfg.Verifier.Configured() {
+		log.Warn("no token validation key configured (PLATE_JWT_PUBLIC_KEY / PLATE_JWT_PUBLIC_KEYS empty) — every authenticated request will 401")
+	}
+	if cfg.DeliverySigningKey == "" {
+		log.Warn("PLATE_DELIVERY_SIGNING_KEY is empty — granted A/V, owner-original downloads, and exports will refuse (503); check the deployed secret is not present-but-empty")
 	}
 
 	svc := service.New(service.Config{
