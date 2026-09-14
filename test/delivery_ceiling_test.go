@@ -43,6 +43,10 @@ type e2e struct {
 	token   string
 	account string
 	priv    ed25519.PrivateKey // to mint tokens for OTHER accounts in a test
+	// lastFinalizeBody is the raw body of the most recent finalize response, kept
+	// so a test can assert what that response CLAIMED — which is what a client
+	// reads — rather than only what a later asset read returns.
+	lastFinalizeBody []byte
 }
 
 func newE2E(t *testing.T, detailCeilingS float64) *e2e {
@@ -169,6 +173,7 @@ func (e *e2e) uploadAndFinalizeOpts(path, contentType, checksum string, skipDeri
 	if fresp.Code != 201 {
 		e.t.Fatalf("finalize: HTTP %d: %s", fresp.Code, fresp.Body.String())
 	}
+	e.lastFinalizeBody = append([]byte(nil), fresp.Body.Bytes()...)
 	return ticket.UploadID
 }
 
@@ -219,6 +224,10 @@ type plateDeliveryResolution struct {
 	Delivery *struct {
 		URL  string `json:"url"`
 		Mode string `json:"mode"`
+		// Structured output dims (present for image/video renditions), so a test
+		// can assert what a consumer would build a srcset from.
+		Width  *int32 `json:"width"`
+		Height *int32 `json:"height"`
 	} `json:"delivery"`
 	Reason *string `json:"reason"`
 }

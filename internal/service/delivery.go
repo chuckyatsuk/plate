@@ -30,29 +30,127 @@ const (
 	HostR2
 )
 
-// ErrUnroutableKind is returned when a media kind has no explicit routing entry.
-// This is the "FAILS, loudly" property: a new MediaKind must be added to the
-// allowlist in the same change, never left to fall through to a metered path.
-type ErrUnroutableKind struct{ Kind plate.MediaKind }
+// ErrUnroutableKind is returned when a (kind, intent) pair has no explicit
+// routing entry. This is the "FAILS, loudly" property: a new MediaKind or Intent
+// must be added to the allowlist in the same change, never left to fall through
+// to a metered path. Intent is zero-valued when a whole kind is unmapped.
+type ErrUnroutableKind struct {
+	Kind   plate.MediaKind
+	Intent plate.Intent
+}
 
 func (e ErrUnroutableKind) Error() string {
-	return fmt.Sprintf("service: media kind %q has no delivery-routing entry — add it to the allowlist in the SAME change, never fall through to a metered CDN", e.Kind)
+	if e.Intent == "" {
+		return fmt.Sprintf("service: media kind %q has no delivery-routing entry — add it to the allowlist in the SAME change, never fall through to a metered CDN", e.Kind)
+	}
+	return fmt.Sprintf("service: (%q, %q) has no delivery-routing entry — add the pair to the allowlist in the SAME change, never fall through to a metered CDN", e.Kind, e.Intent)
 }
 
-// deliveryRoutes is the EXPLICIT allowlist. Images transform → image CDN.
-// Everything else passes through → R2. Closed table keyed by the contract enum.
-var deliveryRoutes = map[plate.MediaKind]DeliveryHost{
-	plate.Image:    HostImageCDN,
-	plate.Video:    HostR2,
-	plate.Audio:    HostR2,
-	plate.Document: HostR2,
+// routeKey is one cell of the allowlist. Routing is keyed on the PAIR because a
+// video's host depends on the intent: its image intents serve the bounded
+// poster through the image engine, while its A/V intents are raw public bytes.
+type routeKey struct {
+	kind   plate.MediaKind
+	intent plate.Intent
 }
 
-// RouteDelivery returns the delivery host for a media kind, or ErrUnroutableKind.
-// Fail closed: an unmapped kind is an error, never a silent default.
-func RouteDelivery(kind plate.MediaKind) (DeliveryHost, error) {
-	host, ok := deliveryRoutes[kind]
+// deliveryRoutes is the EXPLICIT allowlist, keyed by (kind, intent).
+//
+// The property that matters is the SHAPE, not the contents: a total function
+// over closed enums that ERRORS on an unmapped pair, rather than a default
+// branch that quietly picks the metered CDN. That is the cdn-bypass-allowlist
+// landmine (spec §1, §7) — a PDF reaching the image CDN cost real money and
+// produced no error, only a bill.
+//
+// Widened from kind-only in V2.1, because a VIDEO now has two hosts:
+//   - thumbnail/grid/lightbox → the image CDN, serving its POSTER rendition
+//     through the bounded ladder (a full-resolution keyframe handed straight to
+//     a grid tile is the unbounded decode the memory budget exists to prevent).
+//   - poster/loop/detail      → public R2, as A/V bytes always have been. The
+//     metered engine must never see them.
+//   - zoom_*                  → deliberately ABSENT, so they refuse: a deep-zoom
+//     ladder over a video still is not something Plate offers.
+//
+// An entry here is a claim that this pair is SAFE on that host. Adding a kind or
+// an intent without deciding every pair fails the exhaustive test.
+var deliveryRoutes = map[routeKey]DeliveryHost{}
+
+// imageLadderIntents are the bounded image renditions. For an IMAGE they
+// transform the vault original; for a VIDEO they transform its poster rendition.
+var imageLadderIntents = []plate.Intent{plate.Thumbnail, plate.Grid, plate.Lightbox}
+
+// zoomIntents are image-only deep-zoom rungs (Phase 3 A2).
+var zoomIntents = []plate.Intent{plate.Zoom1, plate.Zoom2, plate.Zoom3}
+
+// avIntents are the transcoded A/V renditions — always raw public bytes.
+var avIntents = []plate.Intent{plate.Poster, plate.Loop, plate.Detail}
+
+func init() {
+	// IMAGE: the whole image ladder + zoom rungs transform through the engine.
+	for _, i := range append(append([]plate.Intent{}, imageLadderIntents...), zoomIntents...) {
+		deliveryRoutes[routeKey{plate.Image, i}] = HostImageCDN
+	}
+	// VIDEO: image intents serve the bounded POSTER through the engine; the A/V
+	// renditions stay on R2. Zoom is intentionally unmapped (refuses).
+	for _, i := range imageLadderIntents {
+		deliveryRoutes[routeKey{plate.Video, i}] = HostImageCDN
+	}
+	for _, i := range avIntents {
+		deliveryRoutes[routeKey{plate.Video, i}] = HostR2
+	}
+	// AUDIO: `detail` is the transcode; a cover is an AUTHORED image asset in the
+	// caller's model, never derived here, so audio has no image-ladder route.
+	deliveryRoutes[routeKey{plate.Audio, plate.Detail}] = HostR2
+	// DOCUMENT: passed through whole; no derivation, no transform.
+	deliveryRoutes[routeKey{plate.Document, plate.Original}] = HostR2
+	// `original` is the authenticated download for every kind — never the CDN.
+	for _, k := range []plate.MediaKind{plate.Image, plate.Video, plate.Audio, plate.Document} {
+		deliveryRoutes[routeKey{k, plate.Original}] = HostR2
+	}
+}
+
+// KnownMediaKinds is the closed set of kinds the contract defines, and
+// KnownIntents the closed set of intents. The exhaustive test iterates their
+// CROSS PRODUCT against the table above, so adding either to the contract
+// without deciding every pair fails loudly in the same change.
+func KnownMediaKinds() []plate.MediaKind {
+	return []plate.MediaKind{plate.Image, plate.Video, plate.Audio, plate.Document}
+}
+
+func KnownIntents() []plate.Intent {
+	return []plate.Intent{
+		plate.Thumbnail, plate.Grid, plate.Lightbox,
+		plate.Zoom1, plate.Zoom2, plate.Zoom3,
+		plate.Poster, plate.Loop, plate.Detail,
+		plate.Original,
+	}
+}
+
+// KindHasAnyRoute reports whether a kind is in the allowlist at all. An entirely
+// unmapped kind is the original incident (a new media type silently reaching the
+// metered CDN); an unmapped PAIR on a known kind is the narrower refusal.
+func KindHasAnyRoute(kind plate.MediaKind) bool {
+	for k := range deliveryRoutes {
+		if k.kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// RouteDelivery returns the delivery host for a (kind, intent) pair, or
+// ErrUnroutableKind. Fail closed: an unmapped pair is an error, never a silent
+// default to the metered path.
+func RouteDelivery(kind plate.MediaKind, intent plate.Intent) (DeliveryHost, error) {
+	host, ok := deliveryRoutes[routeKey{kind, intent}]
 	if !ok {
+		// Distinguish "this kind is entirely unknown" (the original incident —
+		// a new media type with no allowlist entry) from "this pair is not
+		// offered" (e.g. zoom on a video), so the error text points at the right
+		// fix. Both fail closed.
+		if KindHasAnyRoute(kind) {
+			return 0, ErrUnroutableKind{Kind: kind, Intent: intent}
+		}
 		return 0, ErrUnroutableKind{Kind: kind}
 	}
 	return host, nil
@@ -93,7 +191,7 @@ func (b URLBuilder) imgproxySource(vaultKey string) string {
 // (spec §3.1, §4.1). Every other intent resolves to a bounded rendition URL on
 // the appropriate host per the allowlist.
 func (b URLBuilder) Resolve(intent plate.Intent, kind plate.MediaKind, vaultKey string) (plate.DeliveryResolution, error) {
-	host, err := RouteDelivery(kind)
+	host, err := RouteDelivery(kind, intent)
 	if err != nil {
 		// Fail loud, not to a metered CDN. The handler renders this as a 500-class
 		// error, never a 200 URL.

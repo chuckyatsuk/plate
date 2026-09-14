@@ -95,6 +95,25 @@ paths:
         and a closed-enum `reason` Files can act on (spec §4.3) — an honest
         refusal is a normal outcome, not an error.
 
+        **A VIDEO's image intents serve its POSTER, bounded.** `thumbnail`,
+        `grid` and `lightbox` on a video asset resolve to the `poster` rendition
+        pushed through the image pipeline — the same bounded ladder an image's
+        vault original gets — so a still of a video is never the raw keyframe.
+        The derived poster is a FULL-RESOLUTION frame; handing that to a grid
+        tile is the unbounded decode the memory budget exists to prevent, so the
+        bounding happens here rather than in every consumer. Those three intents
+        therefore route to the image CDN even though the asset is a video, while
+        `poster`, `loop` and `detail` stay on public R2 as A/V bytes always have
+        (the metered-delivery rule, spec §1/§4.1). Zoom intents refuse on video:
+        a deep-zoom ladder over a video still is not a thing Plate offers.
+        If the poster rendition is not `ready`, an image intent inherits its
+        state — a `not_derived` poster makes `thumbnail` answer `not_derived`
+        too, never `pending`.
+
+        Routing is therefore a total function over **(kind, intent)**, not kind
+        alone, and it errors on any unmapped pair rather than defaulting — the
+        allowlist shape the CDN-bypass incident demands (spec §7).
+
         **Granted mode revokes differently for images vs A/V — build for both.**
         A granted **image** URL is imgproxy-signed: enforced by expiry + tamper
         only, so a revoked grant keeps that image loadable until the URL expires
@@ -777,6 +796,14 @@ components:
         derivations (`skip_derivations`), so polling would wait forever. That
         distinction is the whole reason `not_derived` is a member here and not
         folded into `pending` or `failed` — see RenditionStatus.
+
+        `deleted` means the asset is marked deleted and is no longer served.
+        The two-step delete is about the BYTES — the sweep reclaims them later —
+        not about continuing to serve in the meantime, so delivery refuses from
+        the moment `deleted_at` is set. It is its own member rather than
+        `unauthorized` (nothing about a deleted asset is an authorization
+        question) or a 404 (the owner can still read the asset and see
+        `deleted_at`, so the two endpoints would contradict each other).
       enum:
         - exceeded_duration_ceiling
         - exceeded_size_ceiling
@@ -785,6 +812,7 @@ components:
         - pending
         - failed
         - not_derived
+        - deleted
 
     DeviceClass:
       type: string
