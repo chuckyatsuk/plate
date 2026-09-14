@@ -27,14 +27,22 @@ primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/que
 # setting; it is what keeps the sweeps alive (designer 2026-09-10). If the sweeps
 # ever move to a separate scheduled machine, this can go back to scale-to-zero.
 [[vm]]
-  # ⚠️ TIER 2 (video) MUST flip this back to performance CPU, never shared: ffmpeg
-  # on a throttled shared vCPU crawls and would blow the duration ceilings (spec
-  # Q4): size = "performance-2x", memory = "4gb" (2 perf CPU / 4GB — a 12-min
-  # source ~30min compute). Until video ingests through Plate there is NO ffmpeg
-  # work — the worker only runs the 15-min reconcile sweeps and its heartbeat —
-  # so it idles on the smallest machine (2026-09-14, chuck; ~10× cheaper).
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  # PERFORMANCE CPU, never shared (spec Q4): ffmpeg on a throttled shared vCPU
+  # crawls and would blow the duration ceilings. 2 perf CPU / 4GB — a 12-min
+  # source is ~30min of compute.
+  #
+  # Flipped back for TIER 2 (video) on 2026-09-14, BEFORE any transcode job can
+  # exist: V3 is what starts ingesting video through Plate, and the ordering is
+  # deliberate — the machine must be able to do the work before anything enqueues
+  # it. A 1.4GB source (the seeded "My Friend") on shared-cpu would blow the
+  # lease and the ceilings. This reverses the 2026-09-14 idle-cost drop to
+  # shared-cpu-1x/512mb, which was correct only while there was NO ffmpeg work
+  # (the worker then ran just the 15-min reconcile sweeps and its heartbeat).
+  #
+  # Reversible: if video is deferred again, shared-cpu-1x/512mb is ~10× cheaper
+  # and safe PROVIDED no A/V asset can reach the queue.
+  size = "performance-2x"
+  memory = "4gb"
 # ⚠️ Keep ONE machine always up so the sweep loop runs (see above). The worker has
 # no [http_service], so this is enforced at deploy with
 # `fly scale count worker=1 -a plate-demo-worker` (the process group is "worker",
