@@ -160,6 +160,16 @@ func (s *Service) handleFinalizeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A reclaimed orphan: the sweep already deleted this upload's bytes, so it is
+	// permanently gone. Report that honestly (410) BEFORE the object HEAD, which
+	// would otherwise say the generic "never uploaded" (409) for what is really
+	// "uploaded, abandoned, and reclaimed". FinalizeUpload guards this again at the
+	// row level in case the sweep races after this read.
+	if up.SweptAt != nil {
+		writeError(w, http.StatusGone, "gone", "upload was reclaimed as an orphan; start a new upload")
+		return
+	}
+
 	// Confirm the object actually landed and read its true size (spec §5.3).
 	info, err := s.storage.Head(r.Context(), up.Key)
 	if err != nil {

@@ -49,10 +49,12 @@ func NewReconciler(st *store.Postgres, stor storage.Storage, log *slog.Logger, g
 }
 
 // SweepOnce runs a single reconciliation pass: delete the objects of unfinalized
-// uploads older than the grace window. Returns the number of orphans cleaned.
-// (Deleting the upload ROW is left to a follow-up once object deletion is
-// confirmed; an orphan re-listed after its object is already gone is a cheap
-// no-op delete, so the pass is idempotent.)
+// uploads older than the grace window, then mark each swept so it is cleaned
+// exactly once. ReclaimableUploads excludes swept rows, so a later pass does not
+// re-delete an object that is already gone. Returns the number of orphans cleaned.
+// The upload row is KEPT (marked, not deleted): it records that an upload was
+// started and abandoned, and it is what makes a later finalize on it a terminal
+// 410 (ErrUploadGone) instead of an asset pointing at deleted bytes.
 func (r *Reconciler) SweepOnce(ctx context.Context) (int, error) {
 	cutoff := time.Now().Add(-r.grace)
 	orphans, err := r.store.ReclaimableUploads(ctx, cutoff, r.batchSize)
@@ -62,9 +64,16 @@ func (r *Reconciler) SweepOnce(ctx context.Context) (int, error) {
 	cleaned := 0
 	for _, u := range orphans {
 		if err := r.storage.Delete(ctx, u.Key); err != nil {
-			// Log and continue — one bad key must not stall the sweep.
+			// Log and continue — one bad key must not stall the sweep. swept_at
+			// stays NULL so the next pass retries this orphan.
 			r.log.Warn("reconcile: delete orphan object failed", "key", u.Key, "err", err)
 			continue
+		}
+		// Object gone; mark the row so it is not reclaimed again. A failed mark is
+		// logged but not fatal — the object is already deleted, and the worst case
+		// is one redundant no-op delete next pass (not a correctness problem).
+		if err := r.store.MarkUploadSwept(ctx, u.ID); err != nil {
+			r.log.Warn("reconcile: mark upload swept failed", "upload", u.ID, "err", err)
 		}
 		r.log.Info("reconcile: cleaned orphan upload", "upload", u.ID, "key", u.Key)
 		cleaned++

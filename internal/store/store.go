@@ -37,6 +37,13 @@ var ErrForeignAsset = errors.New("store: asset not owned by this account")
 // legible 4xx, never a 500 (spec Q2, account lifecycle is out-of-band).
 var ErrUnknownAccount = errors.New("store: account has not been provisioned")
 
+// ErrUploadGone is returned when finalize targets an upload whose orphaned bytes
+// were already reclaimed by the reconcile sweep (swept_at set). The vault object
+// no longer exists, so creating an asset from it would produce a broken record;
+// the correct answer is a terminal 410, not a resurrected asset. The service
+// maps it to 410 Gone.
+var ErrUploadGone = errors.New("store: upload was reclaimed as an orphan")
+
 // Store is the account-scoped read path (Phase 1) plus the seams the isolation
 // conformance test drives across every endpoint. EVERY method takes the caller's
 // account as its first argument — the account the service derived from the token
@@ -133,11 +140,18 @@ type Store interface {
 	// to account. Returns the created asset.
 	FinalizeUpload(ctx context.Context, account, uploadID string, v VaultRecord) (plate.Asset, error)
 
-	// ReclaimableUploads returns uploads that were never finalized and are older
-	// than the grace window — the orphans the reconciliation sweep cleans up (spec
-	// §5.1). The sweep itself is Phase 2b (the worker); this read exists now so the
-	// requirement is HELD by a test (decision D5), not just a table.
+	// ReclaimableUploads returns uploads that were never finalized, not yet swept,
+	// and older than the grace window — the orphans the reconciliation sweep cleans
+	// up (spec §5.1). Excluding swept rows is what makes the sweep clean each orphan
+	// exactly once instead of re-deleting the same (already gone) objects forever.
 	ReclaimableUploads(ctx context.Context, olderThan time.Time, limit int32) ([]Upload, error)
+
+	// MarkUploadSwept records that an orphan's object was deleted (swept_at = now),
+	// so it drops out of ReclaimableUploads. Called by the sweep AFTER a successful
+	// object delete — a failed delete leaves the row unmarked so the next pass
+	// retries it. The row is kept as the record of a started-then-abandoned upload
+	// and to stop finalize from resurrecting it (FinalizeUpload → ErrUploadGone).
+	MarkUploadSwept(ctx context.Context, uploadID string) error
 
 	// EnqueueJob queues an A/V derivation job for an owned asset (spec §5.2).
 	// Idempotent per (asset, intent). Account-scoped; the caller confirms
@@ -194,6 +208,10 @@ type Upload struct {
 	ContentType string
 	SizeBytes   int64
 	Filename    string
+	// SweptAt is set once the reconcile sweep has reclaimed this upload's orphaned
+	// object. A non-nil SweptAt means the bytes are gone: finalize must refuse
+	// (410), not treat it as a never-uploaded 409.
+	SweptAt *time.Time
 }
 
 // VaultRecord is the probed truth finalize writes onto the asset's vault object
