@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/chuckyatsuk/plate/internal/storage"
@@ -20,9 +21,10 @@ import (
 // it only touches uploads past the grace window — well after any legitimate PUT
 // would have finalized.
 type Reconciler struct {
-	store   *store.Postgres
-	storage storage.Storage
-	log     *slog.Logger
+	lastSweep atomic.Pointer[time.Time] // newest completed sweepBoth (read by the heartbeat)
+	store     *store.Postgres
+	storage   storage.Storage
+	log       *slog.Logger
 
 	grace     time.Duration // how long after creation an unfinalized upload is an orphan
 	batchSize int32
@@ -127,6 +129,7 @@ func (r *Reconciler) SweepLoop(ctx context.Context, every time.Duration) {
 // sweepBoth runs one pass of each sweep, logging counts. Errors are logged, not
 // returned — the loop must survive a transient store/storage hiccup.
 func (r *Reconciler) sweepBoth(ctx context.Context) {
+	defer func() { now := time.Now(); r.lastSweep.Store(&now) }()
 	if n, err := r.SweepOnce(ctx); err != nil {
 		r.log.Warn("reconcile: orphan-upload sweep failed", "err", err)
 	} else if n > 0 {
@@ -138,3 +141,7 @@ func (r *Reconciler) sweepBoth(ctx context.Context) {
 		r.log.Info("reconcile: deleted-asset sweep done", "purged", n)
 	}
 }
+
+// LastSweep is when the newest reconcile pass completed, nil before the first.
+// Read by the worker heartbeat so /readyz can report sweep freshness.
+func (r *Reconciler) LastSweep() *time.Time { return r.lastSweep.Load() }

@@ -1,11 +1,12 @@
 # Plate worker on Fly.io (spec Q4 — RESOLVED 2026-09-09: Fly.io now, host-agnostic;
 # Cloud Run Jobs / a custom box remain a deploy change, not a rewrite). This
-# manifest deploys ONLY the worker (`plate work`); the API runs on Vercel/its own
-# target, and both point at the same Postgres + R2.
+# manifest deploys ONLY the worker (`plate work`); the API has its own manifest
+# (fly.api.toml), and both point at the same Postgres + R2.
 #
-# ⚠️ NOT DEPLOYED from this repo yet — this file exists so the phase is concrete
-# and the config questions are answered. A real deploy needs R2 + Supabase creds
-# (set as Fly secrets), which are not provisioned here.
+# DEPLOYED (demo): plate-demo-worker in iad, R2 + Supabase creds set as Fly
+# secrets (see the Secrets block below). Deploy + revive:
+#   fly deploy . -a plate-demo-worker -c deploy/fly.toml
+#   fly scale count worker=1 -a plate-demo-worker
 
 app = "plate-demo-worker"  # demo instance; plate-worker reserved for prod (cf. the plate-demo bucket)
 primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/queue lookups in-region)
@@ -26,10 +27,14 @@ primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/que
 # setting; it is what keeps the sweeps alive (designer 2026-09-10). If the sweeps
 # ever move to a separate scheduled machine, this can go back to scale-to-zero.
 [[vm]]
-  # ⚠️ performance CPU, never shared: ffmpeg on a throttled shared vCPU crawls and
-  # would blow the duration ceilings (spec Q4).
-  size = "performance-2x"  # 2 perf CPU / 4GB — a 12-min source ~30min compute
-  memory = "4gb"
+  # ⚠️ TIER 2 (video) MUST flip this back to performance CPU, never shared: ffmpeg
+  # on a throttled shared vCPU crawls and would blow the duration ceilings (spec
+  # Q4): size = "performance-2x", memory = "4gb" (2 perf CPU / 4GB — a 12-min
+  # source ~30min compute). Until video ingests through Plate there is NO ffmpeg
+  # work — the worker only runs the 15-min reconcile sweeps and its heartbeat —
+  # so it idles on the smallest machine (2026-09-14, chuck; ~10× cheaper).
+  size = "shared-cpu-1x"
+  memory = "512mb"
 # ⚠️ Keep ONE machine always up so the sweep loop runs (see above). The worker has
 # no [http_service], so this is enforced at deploy with
 # `fly scale count worker=1 -a plate-demo-worker` (the process group is "worker",
@@ -51,3 +56,10 @@ primary_region = "iad"  # co-locate with the Postgres region (spec Q4: grant/que
   PLATE_ENV = "production"
   PLATE_LOG_LEVEL = "info"
   PLATE_WORKER_CONCURRENCY = "1"
+  # DEMO instance: the worker validates the same JWT key material as the API to
+  # build the service, so it hits the same known-throwaway-key boot guard and
+  # must opt past it identically (see fly.api.toml). A REAL prod instance must
+  # NOT set this (and must use a freshly generated keypair). This line was
+  # missing while the worker sat at zero machines, so the guard (PR #15) had
+  # never been exercised here — the revive surfaced it.
+  PLATE_ALLOW_THROWAWAY_KEYS = "true"

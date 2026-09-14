@@ -304,6 +304,7 @@ func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID s
 //   - for a granted A/V intent: RE-CHECKS grant liveness through the cache, so a
 //     revoked/expired grant stops an ALREADY-ISSUED URL from resolving within one
 //     cache window (spec Q3.B guarantee ii).
+//
 // On success it mints a short (30–60s) R2 presigned GET and 302-redirects, with
 // Cache-Control: private, no-store so no CDN hands one presigned URL to many
 // viewers. Plate sees a tiny request; R2 serves the bytes (Q5).
@@ -767,8 +768,4 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, plate.Health{Status: plate.HealthStatus("ok")})
 }
 
-func (s *Service) handleReady(w http.ResponseWriter, r *http.Request) {
-	// Readiness is DB/storage reachability. Phase 1 checks nothing external here
-	// beyond process liveness; a fuller check lands with the compose stack.
-	writeJSON(w, http.StatusOK, plate.Health{Status: plate.HealthStatus("ok")})
-}
+// handleReady lives in health.go (real dependency checks, Tier 1 monitoring).

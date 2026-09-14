@@ -362,6 +362,8 @@ func serve(log *slog.Logger) error {
 		ImgproxySalt:       cfg.ImgproxySalt,
 		GrantURLTTL:        cfg.GrantURLTTL,
 		GrantCacheTTL:      cfg.GrantCacheTTL,
+		Health:             cfg.Health,
+		Log:                log,
 	})
 
 	srv := &http.Server{
@@ -432,6 +434,24 @@ func work(log *slog.Logger) error {
 		0,                                        // batch size default (100)
 	)
 	go reconciler.SweepLoop(ctx, parseDurationEnv("PLATE_SWEEP_EVERY", 15*time.Minute))
+
+	// Liveness heartbeat (Tier 1 monitoring): the worker has no HTTP surface, so
+	// this row in worker_heartbeats is the ONLY way /readyz — and therefore the
+	// external monitor — can tell a running worker from zero machines. Worker id
+	// is the Fly machine id (else hostname); version is the image ref.
+	workerID := os.Getenv("FLY_MACHINE_ID")
+	if workerID == "" {
+		workerID, _ = os.Hostname()
+	}
+	if workerID == "" {
+		workerID = "worker"
+	}
+	version := os.Getenv("PLATE_VERSION")
+	if version == "" {
+		version = os.Getenv("FLY_IMAGE_REF")
+	}
+	go worker.HeartbeatLoop(ctx, st, log, workerID, version,
+		parseDurationEnv("PLATE_WORKER_HEARTBEAT_EVERY", 30*time.Second), reconciler.LastSweep)
 
 	// Graceful SIGTERM: cancel the loop's context so an in-flight job finishes or
 	// releases its lease, then exit (K8s-ready, spec Q4). This also stops SweepLoop.

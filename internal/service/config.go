@@ -38,6 +38,11 @@ type EnvConfig struct {
 	// service defaults.
 	GrantURLTTL   time.Duration
 	GrantCacheTTL time.Duration
+
+	// Health: /readyz tunables (PLATE_WORKER_STALE_AFTER, PLATE_QUEUE_LAG_MAX,
+	// PLATE_READYZ_TIMEOUT, PLATE_READYZ_CHECKS) + the reported version
+	// (PLATE_VERSION, else Fly's FLY_IMAGE_REF).
+	Health HealthConfig
 }
 
 // LoadEnv builds an EnvConfig from environment variables (see .env.example). It
@@ -62,6 +67,13 @@ func LoadEnv() (EnvConfig, error) {
 		ImgproxySalt:       os.Getenv("IMGPROXY_SALT"),
 		GrantURLTTL:        parseDurationOr("PLATE_GRANTED_URL_TTL", 0),
 		GrantCacheTTL:      parseDurationOr("PLATE_GRANT_CACHE_TTL", 0),
+		Health: HealthConfig{
+			WorkerStaleAfter: parseDurationOr("PLATE_WORKER_STALE_AFTER", 0),
+			QueueLagMax:      parseDurationOr("PLATE_QUEUE_LAG_MAX", 0),
+			CheckTimeout:     parseDurationOr("PLATE_READYZ_TIMEOUT", 0),
+			Checks:           splitCSV(os.Getenv("PLATE_READYZ_CHECKS")),
+			Version:          firstNonEmpty(os.Getenv("PLATE_VERSION"), os.Getenv("FLY_IMAGE_REF")),
+		},
 	}
 
 	// Fail fast on a granted-image window wider than the hard cap (spec Q3.B): a
@@ -331,4 +343,25 @@ func loadEd25519Public(s string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("wrong key size %d, want %d", len(raw), ed25519.PublicKeySize)
 	}
 	return ed25519.PublicKey(raw), nil
+}
+
+// splitCSV splits a comma-separated env value into trimmed, non-empty parts.
+func splitCSV(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// firstNonEmpty returns the first non-empty string.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
