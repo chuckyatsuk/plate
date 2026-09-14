@@ -101,6 +101,29 @@ func TranscodeDetail(t *testing.T, src, dst string) string {
 	return dst
 }
 
+// TranscodeLoop is the `loop` intent — the grid tile's silent hover preview.
+// Built from the SAME mediaspec args the worker uses (condition C1), so a test
+// that measures this output is measuring what production produces.
+//
+// There was no harness function for `loop` until 2026-09-15, and that gap is why
+// the unbounded-loop bug survived: `detail` and the remux path were both
+// engine-verified, `loop` was not, so nothing ever looked at the artifact it
+// produced. The duration cap is now asserted against a real encode.
+func TranscodeLoop(t *testing.T, src, dst string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatalf("harness: mkdir for transcode dst: %v", err)
+	}
+	args := mediaspec.LoopArgs(src, dst, "ultrafast")
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("harness: TranscodeLoop ffmpeg failed: %v\n%s", err, out)
+	}
+	return dst
+}
+
 // RemuxCopy is the stream-copy path (spec §5.5: an already-web-safe source is
 // remuxed, not re-encoded — a rendition may point at a verified original). The
 // spec requires faststart on THIS path too, so a remux-only pass is still

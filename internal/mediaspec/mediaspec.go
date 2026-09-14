@@ -20,6 +20,8 @@
 // _test package and the production worker can import it without cycles.
 package mediaspec
 
+import "strconv"
+
 // ── A/V: ffmpeg arguments per rendition (spec §4.1, §5.4, §5.5) ──────────────
 //
 // These are argument *fragments* assembled into an ffmpeg invocation. The worker
@@ -34,6 +36,23 @@ const DetailVideoFilter = "scale=-2:min(1080\\,ih)"
 // LoopVideoFilter is the scale filter for the `loop` intent: ~640px grid tile,
 // never enlarge (spec §4.1, §5.4: loop is ≤30s, silent, ~640px).
 const LoopVideoFilter = "scale=-2:min(640\\,ih)"
+
+// LoopMaxDurationS caps the `loop` intent's OUTPUT length. The spec has always
+// said "≤30s" (§4.1, §5.4) and the comment above has always repeated it, but
+// until 2026-09-15 nothing enforced it: LoopArgs scaled the video and stripped
+// audio, then re-encoded THE ENTIRE SOURCE. A grid tile's hover preview was a
+// full-length silent copy of the work.
+//
+// Found during the Tier 2 V3 live proof, by the only thing that could find it —
+// a source long enough for the cost to show. Measured: an 89s source produced an
+// 89.047s "loop"; a 269s source's loop job ran over ten minutes and was still
+// going, against 13s for the 89s one. At PLATE_WORKER_CONCURRENCY=1 that is
+// queue time every other job waits behind, and on Uri's multi-minute masters it
+// would be the dominant cost of a backfill.
+//
+// 30s is the spec's number, not a new judgement: long enough for a tile loop to
+// read as motion, short enough that the encode is trivial at any source length.
+const LoopMaxDurationS = 30
 
 // FaststartFlag is the movflags value that puts `moov` before `mdat` so a browser
 // can paint before the whole file downloads. It is applied UNCONDITIONALLY, on
@@ -74,14 +93,26 @@ func DetailArgs(src, dst, preset string) []string {
 }
 
 // LoopArgs returns the ffmpeg argument list for a `loop` transcode: ~640px,
-// SILENT (audio dropped with -an, not muted), faststart. Duration clamping to
-// ≤30s is enforced by the ceiling check before this runs, not here.
+// SILENT (audio dropped with -an, not muted), faststart, and ≤30s.
+//
+// That last clause used to read "duration clamping is enforced by the ceiling
+// check before this runs, not here" — which was FALSE, and is how a grid-tile
+// preview came to be a full-length re-encode of the work. No ceiling check
+// applies to `loop` (the duration ceiling governs `detail` only, and refusing a
+// loop for being long would be wrong anyway — a long video still wants a tile).
+// The cap belongs here, in the arguments, because that is the only place that
+// bounds the WORK rather than rejecting it.
 func LoopArgs(src, dst, preset string) []string {
 	if preset == "" {
 		preset = EncodePreset
 	}
 	return []string{
 		"-hide_banner", "-y", "-i", src,
+		// ≤30s (spec §4.1, §5.4). `-t` AFTER `-i` bounds the OUTPUT, so ffmpeg
+		// stops encoding at 30s instead of walking the whole source — which is
+		// what makes this a cheap job regardless of how long the original is. A
+		// source shorter than the cap is unaffected: -t is a ceiling, not a pad.
+		"-t", strconv.Itoa(LoopMaxDurationS),
 		"-an", // silent — the loop tier carries no audio (spec §5.4)
 		"-c:v", VideoCodec, "-preset", preset,
 		"-vf", LoopVideoFilter,
@@ -164,9 +195,11 @@ const (
 // sized for the band's SQUAREST member — boundaries fit to Uri's 339-image
 // catalogue audit, .scratch/plate-aspect-audit.md: 89% cluster in r∈[1.25,1.6),
 // median 1.499, so boundaries sit in the histogram GAPS, not through the cluster):
-//   near-square  r < 1.25        → 4898  (sized for r=1.0)
-//   standard     1.25 ≤ r < 1.6  → 5477  (sized for r=1.25)
-//   wide         r ≥ 1.6         → 6197  (sized for r=1.6; r clamped at band max)
+//
+//	near-square  r < 1.25        → 4898  (sized for r=1.0)
+//	standard     1.25 ≤ r < 1.6  → 5477  (sized for r=1.25)
+//	wide         r ≥ 1.6         → 6197  (sized for r=1.6; r clamped at band max)
+//
 // ACCEPTED TRADEOFF: the standard band's 5477 cap means a 3:2 median work gets
 // ~20MP at max zoom vs the ~24MP the live ImageKit site serves — a small,
 // deliberate dip on the deepest rung of the dominant aspect, the honest cost of
@@ -175,12 +208,12 @@ const (
 // member and stay ≤ 24MP / ≤ MaxResultDimension.
 // (zoom_1/zoom_2 need no bucketing: square 3072²=9.4MP, 4096²=16.8MP, both <24MP.)
 var PresetWidths = map[string]int{
-	PresetLightbox:       2048,
-	PresetLightboxMobile: 1400,
-	PresetThumbnail:      400,
-	PresetGrid:           800,
-	PresetZoom1:          3072,
-	PresetZoom2:          4096,
+	PresetLightbox:        2048,
+	PresetLightboxMobile:  1400,
+	PresetThumbnail:       400,
+	PresetGrid:            800,
+	PresetZoom1:           3072,
+	PresetZoom2:           4096,
 	PresetZoom3NearSquare: 4898,
 	PresetZoom3Standard:   5477,
 	PresetZoom3Wide:       6197,
