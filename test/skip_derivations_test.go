@@ -39,6 +39,22 @@ func (e *e2e) uploadAndFinalizeSkippingDerivations(path, contentType string) str
 	return e.uploadAndFinalizeOpts(path, contentType, "md5:unverified-in-test", true)
 }
 
+// finalizeResponseSkippingDerivations returns the FINALIZE RESPONSE BODY itself,
+// not just the asset id — so a test can assert what that response claimed at the
+// moment it was sent, which is what a client actually reads.
+func (e *e2e) finalizeResponseSkippingDerivations(path, contentType string) plate.Asset {
+	e.t.Helper()
+	assetID := e.uploadAndFinalizeOpts(path, contentType, "md5:unverified-in-test", true)
+	// uploadAndFinalizeOpts asserts the 201 and keeps the body; re-read it from
+	// the recorded response the helper stashed.
+	var a plate.Asset
+	mustDecode(e.t, e.lastFinalizeBody, &a)
+	if string(a.Id) != assetID {
+		e.t.Fatalf("finalize body asset id %q != %q", a.Id, assetID)
+	}
+	return a
+}
+
 func TestSkipDerivations_MarksEveryDerivableIntentNotDerived(t *testing.T) {
 	harness.RequireFFmpeg(t)
 	e := newE2E(t, 720)

@@ -159,6 +159,7 @@ func (e MediaKind) Valid() bool {
 
 // Defines values for ReasonCode.
 const (
+	ReasonCodeDeleted                 ReasonCode = "deleted"
 	ReasonCodeExceededDurationCeiling ReasonCode = "exceeded_duration_ceiling"
 	ReasonCodeExceededSizeCeiling     ReasonCode = "exceeded_size_ceiling"
 	ReasonCodeFailed                  ReasonCode = "failed"
@@ -171,6 +172,8 @@ const (
 // Valid indicates whether the value is a known member of the ReasonCode enum.
 func (e ReasonCode) Valid() bool {
 	switch e {
+	case ReasonCodeDeleted:
+		return true
 	case ReasonCodeExceededDurationCeiling:
 		return true
 	case ReasonCodeExceededSizeCeiling:
@@ -358,6 +361,14 @@ type DeliveryResolution struct {
 	// derivations (`skip_derivations`), so polling would wait forever. That
 	// distinction is the whole reason `not_derived` is a member here and not
 	// folded into `pending` or `failed` — see RenditionStatus.
+	//
+	// `deleted` means the asset is marked deleted and is no longer served.
+	// The two-step delete is about the BYTES — the sweep reclaims them later —
+	// not about continuing to serve in the meantime, so delivery refuses from
+	// the moment `deleted_at` is set. It is its own member rather than
+	// `unauthorized` (nothing about a deleted asset is an authorization
+	// question) or a 404 (the owner can still read the asset and see
+	// `deleted_at`, so the two endpoints would contradict each other).
 	Reason *ReasonCode `json:"reason,omitempty"`
 }
 
@@ -537,6 +548,14 @@ type Job struct {
 	// derivations (`skip_derivations`), so polling would wait forever. That
 	// distinction is the whole reason `not_derived` is a member here and not
 	// folded into `pending` or `failed` — see RenditionStatus.
+	//
+	// `deleted` means the asset is marked deleted and is no longer served.
+	// The two-step delete is about the BYTES — the sweep reclaims them later —
+	// not about continuing to serve in the meantime, so delivery refuses from
+	// the moment `deleted_at` is set. It is its own member rather than
+	// `unauthorized` (nothing about a deleted asset is an authorization
+	// question) or a 404 (the owner can still read the asset and see
+	// `deleted_at`, so the two endpoints would contradict each other).
 	Reason  *ReasonCode `json:"reason,omitempty"`
 	Retries int32       `json:"retries"`
 	Status  JobStatus   `json:"status"`
@@ -561,6 +580,14 @@ type MediaKind string
 // derivations (`skip_derivations`), so polling would wait forever. That
 // distinction is the whole reason `not_derived` is a member here and not
 // folded into `pending` or `failed` — see RenditionStatus.
+//
+// `deleted` means the asset is marked deleted and is no longer served.
+// The two-step delete is about the BYTES — the sweep reclaims them later —
+// not about continuing to serve in the meantime, so delivery refuses from
+// the moment `deleted_at` is set. It is its own member rather than
+// `unauthorized` (nothing about a deleted asset is an authorization
+// question) or a 404 (the owner can still read the asset and see
+// `deleted_at`, so the two endpoints would contradict each other).
 type ReasonCode string
 
 // RefusalDetail Machine-readable context for a refusal. Fields are optional because they
@@ -596,6 +623,14 @@ type Rendition struct {
 	// derivations (`skip_derivations`), so polling would wait forever. That
 	// distinction is the whole reason `not_derived` is a member here and not
 	// folded into `pending` or `failed` — see RenditionStatus.
+	//
+	// `deleted` means the asset is marked deleted and is no longer served.
+	// The two-step delete is about the BYTES — the sweep reclaims them later —
+	// not about continuing to serve in the meantime, so delivery refuses from
+	// the moment `deleted_at` is set. It is its own member rather than
+	// `unauthorized` (nothing about a deleted asset is an authorization
+	// question) or a 404 (the owner can still read the asset and see
+	// `deleted_at`, so the two endpoints would contradict each other).
 	Reason *ReasonCode `json:"reason,omitempty"`
 
 	// Status What this rendition row IS. Closed enum.
@@ -648,6 +683,14 @@ type RenditionRefusal struct {
 	// derivations (`skip_derivations`), so polling would wait forever. That
 	// distinction is the whole reason `not_derived` is a member here and not
 	// folded into `pending` or `failed` — see RenditionStatus.
+	//
+	// `deleted` means the asset is marked deleted and is no longer served.
+	// The two-step delete is about the BYTES — the sweep reclaims them later —
+	// not about continuing to serve in the meantime, so delivery refuses from
+	// the moment `deleted_at` is set. It is its own member rather than
+	// `unauthorized` (nothing about a deleted asset is an authorization
+	// question) or a 404 (the owner can still read the asset and see
+	// `deleted_at`, so the two endpoints would contradict each other).
 	Reason ReasonCode `json:"reason"`
 }
 

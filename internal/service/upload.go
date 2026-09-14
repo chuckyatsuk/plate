@@ -268,6 +268,17 @@ func (s *Service) handleFinalizeUpload(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			// THE RESPONSE MUST REFLECT STORED STATE (V2.1). `asset` was built
+			// before those marks existed, so returning it here reported
+			// `renditions: []` for an asset that had three not_derived rows — a
+			// lie in the response, and one a client could act on (an ingest
+			// trusting it would conclude nothing was marked). Re-read.
+			if fresh, rerr := s.store.GetAsset(r.Context(), acct, uploadID); rerr == nil {
+				asset = fresh
+			}
+			// A failed re-read is not worth failing the finalize over: the asset
+			// and its marks are already committed, and the caller's next read is
+			// authoritative anyway.
 		} else if _, err := s.store.EnqueueJob(r.Context(), acct, uploadID, plate.Detail); err != nil {
 			// The asset exists; a failed enqueue is recoverable (re-request the
 			// rendition). Do not fail the finalize.

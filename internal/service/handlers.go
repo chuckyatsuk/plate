@@ -467,6 +467,48 @@ func assetIDFromRenditionKey(key string) string {
 // Everything else (any intent on desktop; grid/thumbnail on mobile, already small)
 // keeps the intent's own preset name. Desktop is the default caller (device
 // defaults to mobile only when unspecified, per the contract's safe default).
+// isImageLadderIntent reports whether an intent is one of the bounded image
+// renditions (thumbnail/grid/lightbox). For a VIDEO these serve its poster.
+// Zoom rungs are deliberately excluded: a deep-zoom ladder over a video still is
+// not something Plate offers, so those refuse via the routing table.
+func isImageLadderIntent(intent plate.Intent) bool {
+	for _, i := range imageLadderIntents {
+		if intent == i {
+			return true
+		}
+	}
+	return false
+}
+
+// findRendition returns the rendition row for an intent, if the asset has one.
+func findRendition(asset plate.Asset, intent plate.Intent) (plate.Rendition, bool) {
+	for _, r := range asset.Renditions {
+		if r.Intent == intent {
+			return r, true
+		}
+	}
+	return plate.Rendition{}, false
+}
+
+// renditionStateResolution turns a not-ready (or absent) rendition into the
+// honest refusal for the intent the CALLER asked for. Used when a video's image
+// intent depends on the poster rendition: the answer must describe the poster's
+// real state — `not_derived` stays `not_derived`, a failure carries its reason —
+// and only a genuinely pending or absent one says `pending`.
+func renditionStateResolution(intent plate.Intent, rend plate.Rendition, found bool) plate.DeliveryResolution {
+	if found {
+		switch rend.Status {
+		case plate.RenditionStatusNotDerived:
+			reason := plate.ReasonCodeNotDerived
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
+		case plate.RenditionStatus("failed"):
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: rend.Reason}
+		}
+	}
+	pending := plate.ReasonCodePending
+	return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &pending}
+}
+
 func imagePreset(intent plate.Intent, device plate.DeviceClass, srcW, srcH *int32) string {
 	if device == plate.Mobile {
 		switch intent {
@@ -537,6 +579,15 @@ func fitOutputDims(srcW, srcH *int32, preset string) (w, h int32, ok bool) {
 //     exceeded_duration_ceiling); pending/absent → delivery:null, reason:pending.
 //     device does not affect A/V (their bounds are transcode-time, not per-device).
 func (s *Service) resolveNonOriginal(intent plate.Intent, device plate.DeviceClass, asset plate.Asset) plate.DeliveryResolution {
+	// DELETED MEANS NOT SERVED (V2.1). The two-step delete is about the BYTES —
+	// the sweep reclaims them later — not about continuing to serve in the
+	// meantime. Refuse from the moment deleted_at is set, before any kind branch,
+	// so no path can resolve a URL for an asset the owner has deleted.
+	if asset.DeletedAt != nil {
+		reason := plate.ReasonCodeDeleted
+		return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
+	}
+
 	// Images resolve immediately (imgproxy transforms the vault original on the
 	// fly — no rendition row needed). PUBLIC images are still imgproxy-SIGNED (exp
 	// nil: stable + cacheable) because imgproxy checks all URLs once keyed; the
@@ -562,6 +613,38 @@ func (s *Service) resolveNonOriginal(intent plate.Intent, device plate.DeviceCla
 		}
 		return plate.DeliveryResolution{Intent: intent, Delivery: d}
 	}
+	// A VIDEO's image intents serve its POSTER, bounded (V2.1). The derived
+	// poster is a FULL-RESOLUTION keyframe — handing that to a grid tile is the
+	// unbounded decode the memory budget exists to prevent — so it goes through
+	// the same imgproxy ladder an image's vault original gets. Bounding happens
+	// here, once, rather than in every consumer.
+	//
+	// Source is the poster RENDITION key, not the vault key: the vault holds the
+	// video. Same bucket, so imgproxySource needs no change.
+	if asset.Kind == plate.Video && isImageLadderIntent(intent) {
+		poster, ok := findRendition(asset, plate.Poster)
+		if !ok || poster.Status != plate.RenditionStatus("ready") {
+			// INHERIT the poster's state rather than inventing one: a
+			// `not_derived` poster makes thumbnail answer `not_derived` too, and
+			// a pending one answers pending. Answering `pending` for a poster
+			// that will never exist is the lie this whole tier removed.
+			return renditionStateResolution(intent, poster, ok)
+		}
+		preset := imagePreset(intent, device, poster.Width, poster.Height)
+		u, sok := s.signedImageURL(preset, id.RenditionKey(asset.Vault.Key, string(plate.Poster)), nil)
+		if !sok {
+			reason := plate.ReasonCodeUnsupportedFormat
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason}
+		}
+		d := &plate.Delivery{Url: u, Mode: plate.Public}
+		// Dimensions come from the POSTER rendition, not the video's vault dims,
+		// so this stays correct if posters are ever scaled at derive time.
+		if w, h, okDims := fitOutputDims(poster.Width, poster.Height, preset); okDims {
+			d.Width, d.Height = &w, &h
+		}
+		return plate.DeliveryResolution{Intent: intent, Delivery: d}
+	}
+
 	// Documents pass through R2 directly (no transform) — the public delivery URL.
 	if asset.Kind == plate.Document {
 		res, err := s.urls.Resolve(intent, asset.Kind, asset.Vault.Key)
