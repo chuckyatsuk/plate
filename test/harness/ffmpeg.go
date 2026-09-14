@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,11 +254,29 @@ func FFmpegAvailable() bool {
 	return true
 }
 
-// RequireFFmpeg skips the test unless the engines are present. It surfaces the
-// reason so a green run that quietly skipped everything is visible.
+// RequireFFmpeg skips the test on a bare dev machine, and FAILS it in CI.
+//
+// The asymmetry is the point. A skip keeps `go test ./...` usable on a laptop
+// without ffmpeg, but in CI a skip is indistinguishable from a pass at package
+// granularity — `ok github.com/.../test 158s` looks identical whether the A/V
+// artifact tests ran or silently skipped. That is the false-green shape this
+// project keeps finding the hard way, and it would hide EVERY engine-verified
+// A/V test at once: faststart box order, the duration ceiling, the loop bounds.
+// If the runner image changes or the ffmpeg install step fails, CI must go RED,
+// not quietly stop checking.
+//
+// CI is set by GitHub Actions (and most other runners) automatically.
 func RequireFFmpeg(t *testing.T) {
 	t.Helper()
-	if !FFmpegAvailable() {
-		t.Skipf("ffmpeg/ffprobe not on PATH (%s / %s); install them to run the A/V artifact tests", ffmpegBin(), ffprobeBin())
+	if FFmpegAvailable() {
+		return
 	}
+	msg := fmt.Sprintf(
+		"ffmpeg/ffprobe not on PATH (%s / %s); the A/V artifact tests cannot verify anything without them",
+		ffmpegBin(), ffprobeBin(),
+	)
+	if os.Getenv("CI") != "" {
+		t.Fatalf("%s — CI must install them (see .github/workflows/ci.yml); a skip here would be a green run that checked nothing", msg)
+	}
+	t.Skipf("%s; install them to run the A/V artifact tests", msg)
 }
