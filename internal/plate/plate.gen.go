@@ -464,14 +464,36 @@ type Header struct {
 	Value string `json:"value"`
 }
 
-// Health defines model for Health.
+// Health `ok` — every check passed. `degraded` — the API itself can serve, but a
+// background dependency is unhealthy (the worker is not heartbeating, or the
+// job queue is lagging); served with HTTP 200 so the API stays routable.
+// `down` — a dependency the API needs to serve at all (database, storage)
+// is unreachable; served with HTTP 503. A monitor should alert on BOTH a
+// non-200 and a status other than `ok`.
 type Health struct {
-	Status  HealthStatus `json:"status"`
-	Version *string      `json:"version,omitempty"`
+	// Checks Per-dependency results on /readyz, so a failing probe names what failed.
+	Checks  *HealthChecks `json:"checks,omitempty"`
+	Status  HealthStatus  `json:"status"`
+	Version *string       `json:"version,omitempty"`
 }
 
 // HealthStatus defines model for Health.Status.
 type HealthStatus string
+
+// HealthCheck defines model for HealthCheck.
+type HealthCheck struct {
+	// Detail Short human-readable reason or measurement (e.g. `last heartbeat 4m12s ago`). Never carries account data.
+	Detail *string `json:"detail,omitempty"`
+	Ok     bool    `json:"ok"`
+}
+
+// HealthChecks Per-dependency results on /readyz, so a failing probe names what failed.
+type HealthChecks struct {
+	Db      *HealthCheck `json:"db,omitempty"`
+	Queue   *HealthCheck `json:"queue,omitempty"`
+	Storage *HealthCheck `json:"storage,omitempty"`
+	Worker  *HealthCheck `json:"worker,omitempty"`
+}
 
 // Intent The purpose a URL is for. Closed enum — a caller cannot invent one, and a
 // new media type cannot silently opt into a metered path (spec §4.1).

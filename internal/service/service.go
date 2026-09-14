@@ -12,6 +12,7 @@
 package service
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/chuckyatsuk/plate/internal/auth"
@@ -52,6 +53,12 @@ type Config struct {
 	ImgproxyKey  string
 	ImgproxySalt string
 
+	// Health tunes /readyz (worker staleness, queue lag, per-check timeout,
+	// check allowlist, reported version). Zero values take safe defaults. Log is
+	// used for readiness transitions; nil = slog.Default().
+	Health HealthConfig
+	Log    *slog.Logger
+
 	// GrantURLTTL is how long a granted delivery URL (and its signature) is valid.
 	// Short by design so a forwarded link stops working soon after revocation or
 	// expiry (spec Q3.B). Zero falls back to a safe default.
@@ -77,6 +84,7 @@ type Service struct {
 	imgsigner   *imgproxySigner // nil when no imgproxy key/salt: non-public images refuse
 	grants      *grantCache     // short-TTL grant-verdict cache (spec Q3.B)
 	grantURLTTL time.Duration
+	health      *health // /readyz state + thresholds (Tier 1 monitoring)
 }
 
 // GrantedImageMaxTTL hard-caps how long a granted (or signed) image URL may live.
@@ -110,6 +118,6 @@ func New(cfg Config) *Service {
 		imgsigner:      newImgproxySigner(cfg.ImgproxyKey, cfg.ImgproxySalt),
 		grants:         newGrantCache(cfg.GrantCacheTTL),
 		grantURLTTL:    gurlTTL,
+		health:         newHealth(cfg.Health, cfg.Log),
 	}
 }
-

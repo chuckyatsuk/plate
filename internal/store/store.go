@@ -43,6 +43,15 @@ var ErrUnknownAccount = errors.New("store: account has not been provisioned")
 // claim — and every query predicates on it. There is no method that can be
 // called without an account, by construction.
 type Store interface {
+	// ── health (Tier 1 monitoring; read by /readyz, unauthenticated) ──────────
+	// Ping proves the database is reachable. WorkerLiveness and QueueLag report
+	// the background side (worker heartbeat age, queued-job backlog) so a dead
+	// or stuck worker is visible from the API's readiness, not only from a
+	// Files upload eventually failing. None of these touch account data.
+	Ping(ctx context.Context) error
+	WorkerLiveness(ctx context.Context) (WorkerLiveness, error)
+	QueueLag(ctx context.Context) (QueueLag, error)
+
 	// GetAsset returns the asset if it exists AND belongs to account; otherwise
 	// ErrNotFound. A B-owned asset requested by A is ErrNotFound, not a 200.
 	GetAsset(ctx context.Context, account, assetID string) (plate.Asset, error)

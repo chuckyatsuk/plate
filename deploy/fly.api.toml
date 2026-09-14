@@ -38,7 +38,10 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
 
   [[http_service.checks]]
     method = "GET"
-    path = "/v1/readyz"          # DB/storage reachability (unauthenticated, security:[])
+    path = "/v1/readyz"          # REAL since Tier 1 monitoring: db ping + storage HEAD → 503 "down"
+                                 # (pulls the machine from routing); worker-heartbeat / queue-lag
+                                 # problems are 200 "degraded" so a dead worker never unroutes the
+                                 # API. The EXTERNAL monitor alerts on non-200 OR status != ok.
     interval = "15s"
     timeout = "3s"
     grace_period = "10s"

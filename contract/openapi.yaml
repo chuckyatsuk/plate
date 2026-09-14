@@ -609,11 +609,11 @@ paths:
     get:
       tags: [system]
       operationId: ready
-      summary: Readiness probe (DB and storage reachable).
+      summary: Readiness probe (DB and storage reachable; worker heartbeat and queue lag reported).
       security: []
       responses:
         '200':
-          description: Ready to serve.
+          description: Ready to serve — status `ok`, or `degraded` when only a background dependency (worker/queue) is unhealthy.
           content:
             application/json:
               schema:
@@ -1324,6 +1324,13 @@ components:
       type: object
       additionalProperties: false
       required: [status]
+      description: |
+        `ok` — every check passed. `degraded` — the API itself can serve, but a
+        background dependency is unhealthy (the worker is not heartbeating, or the
+        job queue is lagging); served with HTTP 200 so the API stays routable.
+        `down` — a dependency the API needs to serve at all (database, storage)
+        is unreachable; served with HTTP 503. A monitor should alert on BOTH a
+        non-200 and a status other than `ok`.
       properties:
         status:
           type: string
@@ -1331,6 +1338,34 @@ components:
         version:
           type: string
           maxLength: 64
+        checks:
+          $ref: '#/components/schemas/HealthChecks'
+
+    HealthChecks:
+      type: object
+      additionalProperties: false
+      description: Per-dependency results on /readyz, so a failing probe names what failed.
+      properties:
+        db:
+          $ref: '#/components/schemas/HealthCheck'
+        storage:
+          $ref: '#/components/schemas/HealthCheck'
+        worker:
+          $ref: '#/components/schemas/HealthCheck'
+        queue:
+          $ref: '#/components/schemas/HealthCheck'
+
+    HealthCheck:
+      type: object
+      additionalProperties: false
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        detail:
+          type: string
+          maxLength: 256
+          description: Short human-readable reason or measurement (e.g. `last heartbeat 4m12s ago`). Never carries account data.
 
     Error:
       type: object
