@@ -337,9 +337,9 @@ func (p *Postgres) AssetOwnedBy(ctx context.Context, account, assetID string) (b
 
 func (p *Postgres) CreateUpload(ctx context.Context, account string, u Upload) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO uploads (id, account, key, content_type, size_bytes, filename)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		u.ID, account, u.Key, u.ContentType, u.SizeBytes, nullStr(u.Filename))
+		INSERT INTO uploads (id, account, key, content_type, size_bytes, filename, skip_derivations)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		u.ID, account, u.Key, u.ContentType, u.SizeBytes, nullStr(u.Filename), u.SkipDerivations)
 	if err != nil {
 		// A foreign-key violation on uploads.account means the account was never
 		// provisioned (`plate accounts create`) — a client/config error, not a
@@ -361,10 +361,10 @@ func (p *Postgres) GetUpload(ctx context.Context, account, uploadID string) (Upl
 		filename *string
 	)
 	err := p.pool.QueryRow(ctx, `
-		SELECT id, account, key, content_type, size_bytes, filename, swept_at
+		SELECT id, account, key, content_type, size_bytes, filename, swept_at, skip_derivations
 		FROM uploads
 		WHERE account = $1 AND id = $2`, account, uploadID).
-		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename, &u.SweptAt)
+		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename, &u.SweptAt, &u.SkipDerivations)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Upload{}, ErrNotFound
 	}

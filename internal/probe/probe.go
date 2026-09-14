@@ -31,6 +31,14 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 
+	// WebP is not in the stdlib. Without this import image.DecodeConfig does not
+	// recognise the format, so finalize's header probe fails and a perfectly good
+	// WebP upload is refused 409 unprobeable — the probe is fail-closed, which is
+	// right, but refusing a mainstream web format is not. Decode-only (x/image
+	// has no WebP encoder); the probe only ever reads a header, so that is all
+	// that is needed here.
+	_ "golang.org/x/image/webp"
+
 	plate "github.com/chuckyatsuk/plate/internal/plate"
 )
 
@@ -93,7 +101,7 @@ func (p *Prober) ProbeImage(path string) (Result, error) {
 // ⚠️ LIMIT 1 — EXIF orientation: DecodeConfig does not read it; a rotated JPEG
 // reports STORED (transposed) dimensions. Harmless for the megapixel/decoded-
 // memory math (w*h is identical); revisit with libvips if DISPLAY dims are ever
-// needed. ⚠️ LIMIT 2 — a header-only prefix: enough for JPEG/PNG/GIF headers;
+// needed. ⚠️ LIMIT 2 — a header-only prefix: enough for JPEG/PNG/GIF/WebP headers;
 // exotic formats that back-load their dimensions would need a larger prefix.
 func (p *Prober) ProbeImageReader(r io.Reader) (Result, error) {
 	cfg, format, err := image.DecodeConfig(r)
@@ -105,7 +113,7 @@ func (p *Prober) ProbeImageReader(r io.Reader) (Result, error) {
 		Kind:      plate.Image,
 		Width:     cfg.Width,
 		Height:    cfg.Height,
-		Container: format, // "jpeg", "png", "gif"
+		Container: format, // "jpeg", "png", "gif", "webp"
 	}, nil
 }
 

@@ -588,6 +588,14 @@ func (s *Service) resolveNonOriginal(intent plate.Intent, device plate.DeviceCla
 		case plate.RenditionStatus("failed"):
 			// The honest refusal — carry the rendition's closed-enum reason.
 			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: rend.Reason}
+		case plate.RenditionStatusNotDerived:
+			// The upload declined derivation (skip_derivations), so nothing is
+			// coming on its own. This case is REQUIRED, not decorative: the
+			// default arm below answers `pending`, which would tell a caller to
+			// poll forever for a rendition no automatic path will ever produce.
+			// The row carries no reason (the status says it), so name it here.
+			notDerived := plate.ReasonCodeNotDerived
+			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &notDerived}
 		default: // pending
 			pending := plate.ReasonCodePending
 			return plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &pending}
@@ -684,8 +692,18 @@ func (s *Service) handleRequestRendition(w http.ResponseWriter, r *http.Request)
 
 	// An already-existing rendition for this intent is returned as-is (idempotent
 	// per (asset, intent), per the contract).
+	//
+	// EXCEPT a `not_derived` row, which is treated exactly as if no row existed.
+	// That status means the INGEST declined to derive automatically
+	// (skip_derivations) — it is not a ban on ever deriving. An archive-only
+	// asset the owner later wants shown is an ordinary change of mind, and this
+	// request is that new decision, so it enqueues and the job's result replaces
+	// the row. Terminal for the automatic path, requestable on demand.
 	for _, rend := range asset.Renditions {
 		if rend.Intent == req.Intent {
+			if rend.Status == plate.RenditionStatusNotDerived {
+				break
+			}
 			writeJSON(w, http.StatusOK, rend)
 			return
 		}

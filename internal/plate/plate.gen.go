@@ -162,6 +162,7 @@ const (
 	ReasonCodeExceededDurationCeiling ReasonCode = "exceeded_duration_ceiling"
 	ReasonCodeExceededSizeCeiling     ReasonCode = "exceeded_size_ceiling"
 	ReasonCodeFailed                  ReasonCode = "failed"
+	ReasonCodeNotDerived              ReasonCode = "not_derived"
 	ReasonCodePending                 ReasonCode = "pending"
 	ReasonCodeUnauthorized            ReasonCode = "unauthorized"
 	ReasonCodeUnsupportedFormat       ReasonCode = "unsupported_format"
@@ -176,6 +177,8 @@ func (e ReasonCode) Valid() bool {
 		return true
 	case ReasonCodeFailed:
 		return true
+	case ReasonCodeNotDerived:
+		return true
 	case ReasonCodePending:
 		return true
 	case ReasonCodeUnauthorized:
@@ -189,15 +192,18 @@ func (e ReasonCode) Valid() bool {
 
 // Defines values for RenditionStatus.
 const (
-	RenditionStatusFailed  RenditionStatus = "failed"
-	RenditionStatusPending RenditionStatus = "pending"
-	RenditionStatusReady   RenditionStatus = "ready"
+	RenditionStatusFailed     RenditionStatus = "failed"
+	RenditionStatusNotDerived RenditionStatus = "not_derived"
+	RenditionStatusPending    RenditionStatus = "pending"
+	RenditionStatusReady      RenditionStatus = "ready"
 )
 
 // Valid indicates whether the value is a known member of the RenditionStatus enum.
 func (e RenditionStatus) Valid() bool {
 	switch e {
 	case RenditionStatusFailed:
+		return true
+	case RenditionStatusNotDerived:
 		return true
 	case RenditionStatusPending:
 		return true
@@ -345,6 +351,13 @@ type DeliveryResolution struct {
 
 	// Reason Why no delivery rendition exists. Closed enum (spec §4.3). `unauthorized`
 	// covers a missing/invalid/expired grant on a `granted` asset.
+	//
+	// `pending` and `not_derived` are the two a caller MUST be able to tell
+	// apart: `pending` means the rendition is coming, so polling is correct;
+	// `not_derived` means it will never exist because the upload asked for no
+	// derivations (`skip_derivations`), so polling would wait forever. That
+	// distinction is the whole reason `not_derived` is a member here and not
+	// folded into `pending` or `failed` — see RenditionStatus.
 	Reason *ReasonCode `json:"reason,omitempty"`
 }
 
@@ -517,6 +530,13 @@ type Job struct {
 
 	// Reason Why no delivery rendition exists. Closed enum (spec §4.3). `unauthorized`
 	// covers a missing/invalid/expired grant on a `granted` asset.
+	//
+	// `pending` and `not_derived` are the two a caller MUST be able to tell
+	// apart: `pending` means the rendition is coming, so polling is correct;
+	// `not_derived` means it will never exist because the upload asked for no
+	// derivations (`skip_derivations`), so polling would wait forever. That
+	// distinction is the whole reason `not_derived` is a member here and not
+	// folded into `pending` or `failed` — see RenditionStatus.
 	Reason  *ReasonCode `json:"reason,omitempty"`
 	Retries int32       `json:"retries"`
 	Status  JobStatus   `json:"status"`
@@ -534,6 +554,13 @@ type MediaKind string
 
 // ReasonCode Why no delivery rendition exists. Closed enum (spec §4.3). `unauthorized`
 // covers a missing/invalid/expired grant on a `granted` asset.
+//
+// `pending` and `not_derived` are the two a caller MUST be able to tell
+// apart: `pending` means the rendition is coming, so polling is correct;
+// `not_derived` means it will never exist because the upload asked for no
+// derivations (`skip_derivations`), so polling would wait forever. That
+// distinction is the whole reason `not_derived` is a member here and not
+// folded into `pending` or `failed` — see RenditionStatus.
 type ReasonCode string
 
 // RefusalDetail Machine-readable context for a refusal. Fields are optional because they
@@ -562,7 +589,41 @@ type Rendition struct {
 
 	// Reason Why no delivery rendition exists. Closed enum (spec §4.3). `unauthorized`
 	// covers a missing/invalid/expired grant on a `granted` asset.
-	Reason *ReasonCode     `json:"reason,omitempty"`
+	//
+	// `pending` and `not_derived` are the two a caller MUST be able to tell
+	// apart: `pending` means the rendition is coming, so polling is correct;
+	// `not_derived` means it will never exist because the upload asked for no
+	// derivations (`skip_derivations`), so polling would wait forever. That
+	// distinction is the whole reason `not_derived` is a member here and not
+	// folded into `pending` or `failed` — see RenditionStatus.
+	Reason *ReasonCode `json:"reason,omitempty"`
+
+	// Status What this rendition row IS. Closed enum.
+	//
+	// - `ready`        derived and browser-reachable.
+	// - `pending`      not derived yet; the worker will produce it.
+	// - `failed`       we TRIED and it did not work, or a ceiling was breached
+	//                  (the honest refusal) — `reason` carries which.
+	// - `not_derived`  nobody asked. The upload set `skip_derivations`, so
+	//                  this intent was never enqueued and nothing will derive
+	//                  it automatically. `reason` stays NULL: the status
+	//                  already says everything, and inventing a reason to
+	//                  pair with it would carry no information.
+	//                  Terminal for the AUTOMATIC path only — an explicit
+	//                  rendition request overrides it (the owner changing
+	//                  their mind is a new decision, and the renditions
+	//                  endpoint treats this row as if no row existed).
+	//
+	// `failed` and `not_derived` are deliberately distinct: collapsing them
+	// would make any "what is broken" count include archive-only assets
+	// forever. At delivery the distinction surfaces as ReasonCode
+	// `not_derived`, so a caller can tell "never coming" from `pending`.
+	//
+	// EXTENSION RULE: a new terminal state is a new enum member here plus an
+	// explicit case in the delivery resolver — NEVER a sentinel in `reason`.
+	// The resolver's status switch has a `default` arm, so an unhandled member
+	// silently resolves as `pending` (a lie to a poller) rather than failing to
+	// compile. Adding a member without its case is the bug this rule prevents.
 	Status RenditionStatus `json:"status"`
 	Width  *int32          `json:"width,omitempty"`
 }
@@ -580,6 +641,13 @@ type RenditionRefusal struct {
 
 	// Reason Why no delivery rendition exists. Closed enum (spec §4.3). `unauthorized`
 	// covers a missing/invalid/expired grant on a `granted` asset.
+	//
+	// `pending` and `not_derived` are the two a caller MUST be able to tell
+	// apart: `pending` means the rendition is coming, so polling is correct;
+	// `not_derived` means it will never exist because the upload asked for no
+	// derivations (`skip_derivations`), so polling would wait forever. That
+	// distinction is the whole reason `not_derived` is a member here and not
+	// folded into `pending` or `failed` — see RenditionStatus.
 	Reason ReasonCode `json:"reason"`
 }
 
@@ -593,7 +661,32 @@ type RenditionRequest struct {
 	Intent Intent `json:"intent"`
 }
 
-// RenditionStatus defines model for RenditionStatus.
+// RenditionStatus What this rendition row IS. Closed enum.
+//
+//   - `ready`        derived and browser-reachable.
+//   - `pending`      not derived yet; the worker will produce it.
+//   - `failed`       we TRIED and it did not work, or a ceiling was breached
+//     (the honest refusal) — `reason` carries which.
+//   - `not_derived`  nobody asked. The upload set `skip_derivations`, so
+//     this intent was never enqueued and nothing will derive
+//     it automatically. `reason` stays NULL: the status
+//     already says everything, and inventing a reason to
+//     pair with it would carry no information.
+//     Terminal for the AUTOMATIC path only — an explicit
+//     rendition request overrides it (the owner changing
+//     their mind is a new decision, and the renditions
+//     endpoint treats this row as if no row existed).
+//
+// `failed` and `not_derived` are deliberately distinct: collapsing them
+// would make any "what is broken" count include archive-only assets
+// forever. At delivery the distinction surfaces as ReasonCode
+// `not_derived`, so a caller can tell "never coming" from `pending`.
+//
+// EXTENSION RULE: a new terminal state is a new enum member here plus an
+// explicit case in the delivery resolver — NEVER a sentinel in `reason`.
+// The resolver's status switch has a `default` arm, so an unhandled member
+// silently resolves as `pending` (a lie to a poller) rather than failing to
+// compile. Adding a member without its case is the bug this rule prevents.
 type RenditionStatus string
 
 // UploadId defines model for UploadId.
@@ -611,6 +704,32 @@ type UploadRequest struct {
 
 	// SizeBytes Exact declared byte size. Bound into the presigned PUT's signature as the exact content-length — the object must be exactly this many bytes (a presigned PUT signs an exact length, not a range).
 	SizeBytes int64 `json:"size_bytes"`
+
+	// SkipDerivations Vault the original WITHOUT deriving anything from it. Additive and
+	// optional: omit it (the default) and finalize behaves exactly as
+	// before, auto-enqueuing `detail` for audio/video.
+	//
+	// Set it when the bytes are the point and no derivative is wanted — a
+	// document of record, archive-only video. finalize then enqueues no
+	// job and records EVERY derivable intent for the asset's kind as
+	// RenditionStatus `not_derived`, so each one answers honestly: a
+	// delivery call gets `delivery: null` + reason `not_derived` rather
+	// than `pending`. Marking only the auto-enqueued intent would leave the
+	// others absent, and absent still reads as `pending` — the same lie in
+	// a different place. Without this flag the auto-enqueued `detail` is
+	// unavoidable: there is no other opt-out.
+	//
+	// TERMINAL FOR THE AUTOMATIC PATH, REQUESTABLE ON DEMAND. Nothing will
+	// ever derive these on its own — that is what `not_derived` promises.
+	// But the flag declines the automatic enqueue at ingest; it is not a
+	// ban on ever deriving. An archive-only video the studio later decides
+	// to show is an ordinary change of mind, and the owner asking for a
+	// rendition is a NEW decision that is honoured: a POST to the
+	// renditions endpoint treats a `not_derived` row exactly as it treats
+	// no row at all — it enqueues, and the job's result replaces the row.
+	// The override lives at the point the request is made, not in a
+	// re-finalize path.
+	SkipDerivations *bool `json:"skip_derivations,omitempty"`
 }
 
 // UploadTicket A presigned PUT the browser can use for exactly one object, plus the id to finalize with.

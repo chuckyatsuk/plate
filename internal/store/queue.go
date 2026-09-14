@@ -288,6 +288,29 @@ func (p *Postgres) FailedRenditionForCeiling(ctx context.Context, assetID string
 	return err
 }
 
+// MarkNotDerived records that an intent will not be derived automatically,
+// because the upload declined derivation (skip_derivations). Terminal for the
+// AUTOMATIC path: nothing enqueues it, and delivery answers delivery:null +
+// reason `not_derived` rather than `pending` — the distinction that stops a
+// caller polling forever for something no job will produce.
+//
+// `reason` is deliberately left NULL: the status already says everything, and a
+// reason paired with it would carry no information the status lacks.
+//
+// DO NOT overwrite a row that already exists. A real rendition (ready, or a
+// failed refusal carrying its reason) is a FACT about work that happened; this
+// mark is only the absence of work. ON CONFLICT DO NOTHING keeps an explicit
+// later derivation — which is allowed to override a not_derived row — from
+// being clobbered if a finalize were ever replayed.
+func (p *Postgres) MarkNotDerived(ctx context.Context, assetID string, intent plate.Intent) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO renditions (asset, intent, status)
+		VALUES ($1, $2, 'not_derived')
+		ON CONFLICT (asset, intent) DO NOTHING`,
+		assetID, string(intent))
+	return err
+}
+
 // RenditionRecord is what CompleteJob writes for the produced rendition.
 type RenditionRecord struct {
 	Key       string

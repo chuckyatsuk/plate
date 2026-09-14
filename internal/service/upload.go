@@ -78,6 +78,8 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 		ContentType: req.ContentType,
 		SizeBytes:   req.SizeBytes,
 		Filename:    filename,
+		// Declared here, acted on at finalize — the flag rides on the row.
+		SkipDerivations: req.SkipDerivations != nil && *req.SkipDerivations,
 	}); err != nil {
 		if errors.Is(err, store.ErrUnknownAccount) {
 			// The token's account has no row yet — provision it with
@@ -113,6 +115,27 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 // with room to spare while remaining a trivially bounded single ranged read —
 // the point of the constant is bounding the request, not starving the parser.
 const imageProbePrefixBytes = 1024 * 1024
+
+// derivableIntents is the EXPLICIT, closed table of intents a worker derives for
+// each kind — what `skip_derivations` declines, one `not_derived` row each.
+//
+// Every derivable intent gets a row, not just the auto-enqueued `detail`:
+// marking only `detail` would leave `poster` and `loop` absent, and an absent
+// rendition resolves as `pending` — the same lie the status exists to remove.
+//
+// IMAGE is deliberately ABSENT, and that is not an omission: image intents are
+// resolved synchronously by imgproxy from the vault original (no worker, no
+// rendition rows at all), so there is nothing to decline — `skip_derivations` on
+// an image is a no-op by construction. AUDIO derives only `detail`; its cover is
+// an AUTHORED image relation, never something Plate derives (spec §5.4).
+//
+// EXTENSION RULE: a new derivable intent for a kind is added HERE as well as to
+// the worker, or a skip_derivations upload would leave it silently answering
+// `pending` forever.
+var derivableIntents = map[plate.MediaKind][]plate.Intent{
+	plate.Video: {plate.Poster, plate.Loop, plate.Detail},
+	plate.Audio: {plate.Detail},
+}
 
 // handleFinalizeUpload registers the vault object after a successful PUT (spec
 // §5.1, §5.3 refined per review ruling 1). Fail-closed means the vault never
@@ -227,8 +250,25 @@ func (s *Service) handleFinalizeUpload(w http.ResponseWriter, r *http.Request) {
 
 	// A/V: enqueue the worker to probe + transcode. Enqueue the detail intent as
 	// the default derivation; other intents are requested explicitly later.
+	//
+	// UNLESS the upload declined derivation. `skip_derivations` is the only
+	// opt-out of that auto-enqueue: without it the detail job is unavoidable,
+	// which is wrong for an archive-only original where the bytes are the point
+	// (a document of record). Then, instead of a job, record every derivable
+	// intent terminally as `not_derived` so each one answers honestly rather
+	// than pretending to be on its way.
 	if kind == plate.Video || kind == plate.Audio {
-		if _, err := s.store.EnqueueJob(r.Context(), acct, uploadID, plate.Detail); err != nil {
+		if up.SkipDerivations {
+			for _, intent := range derivableIntents[kind] {
+				if err := s.store.MarkNotDerived(r.Context(), uploadID, intent); err != nil {
+					// The asset exists and is correct; the marks are what make it
+					// legible. A partial mark would answer `pending` for the rest,
+					// so this is worth surfacing rather than swallowing.
+					writeError(w, http.StatusInternalServerError, "internal", "asset created but derivation opt-out not recorded")
+					return
+				}
+			}
+		} else if _, err := s.store.EnqueueJob(r.Context(), acct, uploadID, plate.Detail); err != nil {
 			// The asset exists; a failed enqueue is recoverable (re-request the
 			// rendition). Do not fail the finalize.
 			writeError(w, http.StatusInternalServerError, "internal", "asset created but enqueue failed")
