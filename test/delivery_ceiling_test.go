@@ -117,6 +117,14 @@ func (e *e2e) uploadAndFinalize(path, contentType string) string {
 // uploadAndFinalizeWithChecksum is uploadAndFinalize with an explicit finalize
 // checksum claim (so the checksum-verification tests can pass a real md5:…).
 func (e *e2e) uploadAndFinalizeWithChecksum(path, contentType, checksum string) string {
+	return e.uploadAndFinalizeOpts(path, contentType, checksum, false)
+}
+
+// uploadAndFinalizeOpts is the full form. `skipDerivations` sets the
+// createUpload flag that declines the automatic derivation at ingest; false
+// omits the field entirely, so the default path is byte-identical to what the
+// other tests send.
+func (e *e2e) uploadAndFinalizeOpts(path, contentType, checksum string, skipDerivations bool) string {
 	e.t.Helper()
 	data, err := readFile(path)
 	if err != nil {
@@ -124,7 +132,11 @@ func (e *e2e) uploadAndFinalizeWithChecksum(path, contentType, checksum string) 
 	}
 
 	// createUpload
-	body := mustJSON(map[string]any{"content_type": contentType, "size_bytes": len(data)})
+	create := map[string]any{"content_type": contentType, "size_bytes": len(data)}
+	if skipDerivations {
+		create["skip_derivations"] = true
+	}
+	body := mustJSON(create)
 	resp := e.req("POST", "/v1/uploads", body)
 	if resp.Code != 201 {
 		e.t.Fatalf("createUpload: HTTP %d: %s", resp.Code, resp.Body.String())

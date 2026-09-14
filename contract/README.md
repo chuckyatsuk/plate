@@ -43,8 +43,18 @@ go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest \
   contract/openapi.yaml > plate.gen.go
 ```
 
-Generation is not committed here — it belongs next to each consumer. The
-contract is the artifact; the generated code is a build product.
+The contract is the artifact; the generated code is a build product — but the
+Go side's build product IS committed, at `internal/plate/plate.gen.go`, so the
+service compiles without a generation step and a contract change shows up as a
+reviewable diff on both files at once. Regenerate it with the pinned directive
+in `internal/plate/generate.go` (oapi-codegen v2.8.0), never the `@latest` line
+above, which would mix generator drift into the diff:
+
+```sh
+go generate ./internal/plate
+```
+
+The TypeScript client is NOT committed here — it belongs next to its consumer.
 
 ## Scope
 

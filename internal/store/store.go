@@ -157,6 +157,11 @@ type Store interface {
 	// Idempotent per (asset, intent). Account-scoped; the caller confirms
 	// ownership before enqueue.
 	EnqueueJob(ctx context.Context, account, assetID string, intent plate.Intent) (plate.Job, error)
+
+	// MarkNotDerived records an intent as terminally not-derived-automatically,
+	// for an upload that declined derivation (skip_derivations). Never
+	// overwrites an existing rendition row.
+	MarkNotDerived(ctx context.Context, assetID string, intent plate.Intent) error
 }
 
 // GrantVerdict is the outcome of resolving a grant for delivery. It exists to
@@ -208,6 +213,10 @@ type Upload struct {
 	ContentType string
 	SizeBytes   int64
 	Filename    string
+	// SkipDerivations is declared at createUpload and acted on at finalize (two
+	// different requests), so it rides on the upload row in between: no auto
+	// enqueue, and every derivable intent recorded `not_derived` instead.
+	SkipDerivations bool
 	// SweptAt is set once the reconcile sweep has reclaimed this upload's orphaned
 	// object. A non-nil SweptAt means the bytes are gone: finalize must refuse
 	// (410), not treat it as a never-uploaded 409.
