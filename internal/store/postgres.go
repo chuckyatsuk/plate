@@ -361,10 +361,10 @@ func (p *Postgres) GetUpload(ctx context.Context, account, uploadID string) (Upl
 		filename *string
 	)
 	err := p.pool.QueryRow(ctx, `
-		SELECT id, account, key, content_type, size_bytes, filename
+		SELECT id, account, key, content_type, size_bytes, filename, swept_at
 		FROM uploads
 		WHERE account = $1 AND id = $2`, account, uploadID).
-		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename)
+		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename, &u.SweptAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Upload{}, ErrNotFound
 	}
@@ -391,16 +391,25 @@ func (p *Postgres) FinalizeUpload(ctx context.Context, account, uploadID string,
 		ctype    string
 		filename *string
 		finAt    *time.Time
+		sweptAt  *time.Time
 	)
 	err = tx.QueryRow(ctx, `
-		SELECT key, content_type, filename, finalized_at
+		SELECT key, content_type, filename, finalized_at, swept_at
 		FROM uploads WHERE account = $1 AND id = $2 FOR UPDATE`,
-		account, uploadID).Scan(&key, &ctype, &filename, &finAt)
+		account, uploadID).Scan(&key, &ctype, &filename, &finAt, &sweptAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return plate.Asset{}, ErrNotFound
 	}
 	if err != nil {
 		return plate.Asset{}, err
+	}
+
+	// Reclaimed orphan: the sweep already deleted this upload's vault bytes, so
+	// there is nothing to finalize into an asset. Refuse (410) rather than create
+	// an asset pointing at a deleted object. Checked before the finalized_at
+	// idempotency branch because a swept upload was never finalized.
+	if sweptAt != nil {
+		return plate.Asset{}, ErrUploadGone
 	}
 
 	// Idempotent: if already finalized, return the existing asset rather than
@@ -460,7 +469,7 @@ func (p *Postgres) ReclaimableUploads(ctx context.Context, olderThan time.Time, 
 	rows, err := p.pool.Query(ctx, `
 		SELECT id, account, key, content_type, size_bytes, filename
 		FROM uploads
-		WHERE finalized_at IS NULL AND created < $1
+		WHERE finalized_at IS NULL AND swept_at IS NULL AND created < $1
 		ORDER BY created
 		LIMIT $2`, olderThan, limit)
 	if err != nil {
@@ -482,6 +491,16 @@ func (p *Postgres) ReclaimableUploads(ctx context.Context, olderThan time.Time, 
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// MarkUploadSwept stamps swept_at on a reclaimed orphan so it is not re-selected
+// by ReclaimableUploads. Not account-scoped: the reconcile sweep is a system job
+// that already selected this id from ReclaimableUploads. Idempotent (a second
+// mark is a harmless no-op update).
+func (p *Postgres) MarkUploadSwept(ctx context.Context, uploadID string) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE uploads SET swept_at = now() WHERE id = $1`, uploadID)
+	return err
 }
 
 // getAssetTx reads an account-scoped asset within a transaction (used by

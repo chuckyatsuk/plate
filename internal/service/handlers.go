@@ -68,6 +68,10 @@ func mapStoreErr(w http.ResponseWriter, err error) bool {
 		// A grant over an asset the caller does not own. Deny without echoing
 		// which asset was foreign.
 		writeError(w, http.StatusForbidden, "forbidden", "one or more assets are not owned by this account")
+	case errors.Is(err, store.ErrUploadGone):
+		// The upload's orphaned bytes were reclaimed by the sweep before finalize;
+		// the resource is permanently gone (start a fresh upload).
+		writeError(w, http.StatusGone, "gone", "upload was reclaimed as an orphan; start a new upload")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")
 	}
