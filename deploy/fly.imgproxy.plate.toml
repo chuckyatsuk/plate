@@ -1,0 +1,90 @@
+# imgproxy — PRODUCTION (Tier 4). The image transform engine Plate's delivery URLs
+# point at. Plate builds image URLs as {IMGPROXY_BASE_URL}/{preset}/plain/{s3-vault-src};
+# this app transforms the vault original per the named preset and serves it. Separate
+# app (prebuilt public image, not our source), like the API and worker.
+#
+# Production successor to deploy/fly.imgproxy.toml (plate-demo-imgproxy). Only the
+# app name changes: the S3 endpoint is ACCOUNT-level (the same R2 account backs the
+# `plate` bucket), and imgproxy resolves the bucket from the full s3:// source Plate
+# emits (driven by the API's R2_DEFAULT_BUCKET=plate), so no bucket name appears here.
+#
+# ⚠️ Uses the prebuilt darthsim/imgproxy image, so there is NO source [build] — `image =`.
+# Deploy: `fly deploy -a plate-imgproxy -c deploy/fly.imgproxy.plate.toml`
+# The CDN host plate-img.everysinglefile.com (Cloudflare → plate-imgproxy.fly.dev,
+# cache rule) is the API's IMGPROXY_BASE_URL, set in A4/A5 — NOT here.
+
+app = "plate-imgproxy"
+primary_region = "iad"  # near the API + Supabase; imgproxy fetches originals over HTTPS
+
+[build]
+  image = "darthsim/imgproxy:latest"
+
+[env]
+  # ONLY_PRESETS: refuse ad-hoc width/quality/crop params — a caller can only name
+  # a purpose (spec §4.1). This is the lockdown that makes "intent, not
+  # transformation" structural, and what the image-clamp tests rely on.
+  IMGPROXY_ONLY_PRESETS = "true"
+
+  # Presets: the intent→resize definitions. MUST equal `plate imgproxy-presets`
+  # (mediaspec.PresetDefs — the single source the image-clamp tests verify). If
+  # mediaspec changes, regenerate this line:  go run ./cmd/plate imgproxy-presets
+  IMGPROXY_PRESETS = "lightbox=resize:fit:2048:2048:0/enlarge:0,lightbox_mobile=resize:fit:1400:1400:0/enlarge:0,thumbnail=resize:fit:400:400:0/enlarge:0,grid=resize:fit:800:800:0/enlarge:0,zoom_1=resize:fit:3072:3072:0/enlarge:0/quality:100,zoom_2=resize:fit:4096:4096:0/enlarge:0/quality:100,zoom_3_nearsquare=resize:fit:4898:4898:0/enlarge:0/quality:100,zoom_3_standard=resize:fit:5477:5477:0/enlarge:0/quality:100,zoom_3_wide=resize:fit:6197:6197:0/enlarge:0/quality:100"
+
+  # Origin: imgproxy fetches originals via PRIVATE S3 (R2), so a vault original is
+  # NEVER publicly reachable (the wall, spec §3.1/Q5). Plate emits image sources as
+  # s3://{bucket}/vault/{account}/{asset}; imgproxy resolves them with its own R2
+  # credentials (set as secrets, below). There is deliberately NO IMGPROXY_BASE_URL
+  # here — the source is a full s3:// URL, and a public HTTP base would reopen the
+  # very hole this closes.
+  IMGPROXY_USE_S3 = "true"
+  IMGPROXY_S3_ENDPOINT = "https://87c7daae690b39a2efedf6ef10773606.r2.cloudflarestorage.com"
+  IMGPROXY_S3_REGION = "auto"
+
+  # Headroom so a large original is CLAMPED by the preset, not rejected as
+  # oversized (spec §7: "returns a clamped rendition, never a 400"). 100MP covers
+  # the biggest studio shots.
+  IMGPROXY_MAX_SRC_RESOLUTION = "100"
+
+  # Result-edge belt (mediaspec.MaxResultDimension). imgproxy has NO area/megapixel
+  # result limit, only this longest-EDGE cap. Set to the largest legitimate preset
+  # edge (zoom_3 wide band = 6197) so a future preset misconfig or a forgotten cap
+  # can't exceed the area ceiling on an edge — defense in depth behind the
+  # aspect-bucketed per-preset caps. Keep in lockstep with mediaspec (drift test).
+  IMGPROXY_MAX_RESULT_DIMENSION = "6197"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"          # imgproxy's built-in health endpoint
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"      # image transforms are light per-request; scale out, not up
+  memory = "512mb"
+
+# ── Secrets (fly secrets set -a plate-imgproxy …) ────────────────────────────
+# 1. Signing — MUST match the API's IMGPROXY_KEY / IMGPROXY_SALT (the REAL prod values
+#    from A2), or imgproxy runs unsafe and Plate's signed URLs won't verify:
+#      IMGPROXY_KEY   (hex)  — same value as on plate-api
+#      IMGPROXY_SALT  (hex)  — same value as on plate-api
+# 2. R2 credentials for the private S3 origin (AWS-standard names imgproxy reads):
+#      AWS_ACCESS_KEY_ID       = R2_ACCESS_KEY_ID
+#      AWS_SECRET_ACCESS_KEY   = R2_SECRET_ACCESS_KEY
+#    Scope: this token needs READ on vault/* of the `plate` bucket (imgproxy only reads
+#    originals).
+#
+# ⚠️ THE VAULT WALL (Tier 4 amendment): on the `plate-media.everysinglefile.com` public
+# domain, the wall is a CLOUDFLARE FIREWALL RULE (block public /vault/* → 403 CF body),
+# NOT an R2 setting — replicate the demo domain's exact rule BEFORE anything is written
+# to `plate`. imgproxy reaches vault/ only via the private S3 credential above. Verify
+# against a REAL existing vault key (a 404 on a missing key proves nothing):
+#   GET https://plate-media.everysinglefile.com/vault/<real-existing-key> → 403 (CF)
+#   GET https://plate-media.everysinglefile.com/delivery/<real-rendition> → 200
