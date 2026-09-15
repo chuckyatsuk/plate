@@ -9,11 +9,11 @@
 # emits (driven by the API's R2_DEFAULT_BUCKET=plate), so no bucket name appears here.
 #
 # ⚠️ Uses the prebuilt darthsim/imgproxy image, so there is NO source [build] — `image =`.
-# Deploy: `fly deploy -a plate-imgproxy -c deploy/fly.imgproxy.plate.toml`
-# The CDN host plate-img.everysinglefile.com (Cloudflare → plate-imgproxy.fly.dev,
+# Deploy: `fly deploy -a esf-plate-imgproxy -c deploy/fly.imgproxy.plate.toml`
+# The CDN host plate-img.everysinglefile.com (Cloudflare → esf-plate-imgproxy.fly.dev,
 # cache rule) is the API's IMGPROXY_BASE_URL, set in A4/A5 — NOT here.
 
-app = "plate-imgproxy"
+app = "esf-plate-imgproxy"
 primary_region = "iad"  # near the API + Supabase; imgproxy fetches originals over HTTPS
 
 [build]
@@ -70,11 +70,11 @@ primary_region = "iad"  # near the API + Supabase; imgproxy fetches originals ov
   size = "shared-cpu-1x"      # image transforms are light per-request; scale out, not up
   memory = "512mb"
 
-# ── Secrets (fly secrets set -a plate-imgproxy …) ────────────────────────────
+# ── Secrets (fly secrets set -a esf-plate-imgproxy …) ────────────────────────────
 # 1. Signing — MUST match the API's IMGPROXY_KEY / IMGPROXY_SALT (the REAL prod values
 #    from A2), or imgproxy runs unsafe and Plate's signed URLs won't verify:
-#      IMGPROXY_KEY   (hex)  — same value as on plate-api
-#      IMGPROXY_SALT  (hex)  — same value as on plate-api
+#      IMGPROXY_KEY   (hex)  — same value as on esf-plate-api
+#      IMGPROXY_SALT  (hex)  — same value as on esf-plate-api
 # 2. R2 credentials for the private S3 origin (AWS-standard names imgproxy reads):
 #      AWS_ACCESS_KEY_ID       = R2_ACCESS_KEY_ID
 #      AWS_SECRET_ACCESS_KEY   = R2_SECRET_ACCESS_KEY

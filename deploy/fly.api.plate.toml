@@ -12,7 +12,7 @@
 #
 # ⚠️ Secrets are set with `fly secrets set` (NEVER committed). See the checklist below.
 
-app = "plate-api"
+app = "esf-plate-api"
 primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download grant
                         # liveness lookup and every store query hit Postgres in-region.
 
@@ -60,7 +60,7 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
   size = "shared-cpu-1x"
   memory = "512mb"
 
-# ── Secrets checklist (fly secrets set -a plate-api …) ───────────────────────
+# ── Secrets checklist (fly secrets set -a esf-plate-api …) ───────────────────────
 # Required (API 503s the write path / denies tokens without these):
 #   DATABASE_URL                 the IPv4 SESSION pooler DSN (direct host is IPv6-only)
 #   R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_REGION   (same account as demo)
@@ -72,12 +72,12 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
 # Delivery (granted/signed/original — set so the byte edge is enforceable):
 #   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download — a REAL prod secret (A2),
 #                                NOT the demo throwaway
-#   IMGPROXY_KEY IMGPROXY_SALT   hex — REAL prod values (A2); MUST match plate-imgproxy
+#   IMGPROXY_KEY IMGPROXY_SALT   hex — REAL prod values (A2); MUST match esf-plate-imgproxy
 #   IMGPROXY_BASE_URL = https://plate-img.everysinglefile.com   the CDN-fronted imgproxy
-#                                host (Cloudflare → plate-imgproxy.fly.dev, cache rule).
+#                                host (Cloudflare → esf-plate-imgproxy.fly.dev, cache rule).
 #   R2_PUBLIC_BASE   = https://plate-media.everysinglefile.com  the `plate` bucket's A/V
 #                                public custom domain (loops/details/original bytes).
-#   PLATE_DOWNLOAD_BASE = https://plate-api.fly.dev             this API's own public base.
+#   PLATE_DOWNLOAD_BASE = https://esf-plate-api.fly.dev             this API's own public base.
 # Optional tunables (safe defaults):
 #   PLATE_GRANTED_URL_TTL (<=120s), PLATE_GRANT_CACHE_TTL, PLATE_UPLOAD_URL_TTL,
 #   PLATE_JWT_ISSUER, PLATE_JWT_AUDIENCE
