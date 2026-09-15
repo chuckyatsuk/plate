@@ -39,9 +39,9 @@ type EnvConfig struct {
 	GrantURLTTL   time.Duration
 	GrantCacheTTL time.Duration
 
-	// Health: /readyz tunables (PLATE_WORKER_STALE_AFTER, PLATE_QUEUE_LAG_MAX,
-	// PLATE_READYZ_TIMEOUT, PLATE_READYZ_CHECKS) + the reported version
-	// (PLATE_VERSION, else Fly's FLY_IMAGE_REF).
+	// Health: /readyz tunables (PLATE_WORKER_STALE_AFTER,
+	// PLATE_WORKER_PROGRESS_WINDOW, PLATE_READYZ_TIMEOUT, PLATE_READYZ_CHECKS) + the
+	// reported version (PLATE_VERSION, else Fly's FLY_IMAGE_REF).
 	Health HealthConfig
 }
 
@@ -68,11 +68,11 @@ func LoadEnv() (EnvConfig, error) {
 		GrantURLTTL:        parseDurationOr("PLATE_GRANTED_URL_TTL", 0),
 		GrantCacheTTL:      parseDurationOr("PLATE_GRANT_CACHE_TTL", 0),
 		Health: HealthConfig{
-			WorkerStaleAfter: parseDurationOr("PLATE_WORKER_STALE_AFTER", 0),
-			QueueLagMax:      parseDurationOr("PLATE_QUEUE_LAG_MAX", 0),
-			CheckTimeout:     parseDurationOr("PLATE_READYZ_TIMEOUT", 0),
-			Checks:           splitCSV(os.Getenv("PLATE_READYZ_CHECKS")),
-			Version:          firstNonEmpty(os.Getenv("PLATE_VERSION"), os.Getenv("FLY_IMAGE_REF")),
+			WorkerStaleAfter:     parseDurationOr("PLATE_WORKER_STALE_AFTER", 0),
+			WorkerProgressWindow: parseDurationOr("PLATE_WORKER_PROGRESS_WINDOW", 0),
+			CheckTimeout:         parseDurationOr("PLATE_READYZ_TIMEOUT", 0),
+			Checks:               splitCSV(os.Getenv("PLATE_READYZ_CHECKS")),
+			Version:              firstNonEmpty(os.Getenv("PLATE_VERSION"), os.Getenv("FLY_IMAGE_REF")),
 		},
 	}
 
