@@ -132,6 +132,77 @@ func TestQueue_StaleLeaseIsReclaimed(t *testing.T) {
 	}
 }
 
+// SHORT work is claimed before an older long transcode (Tier 2 V4.1). A poster
+// enqueued AFTER a detail must still run first — the claim order keys on intent
+// priority, not just created — so the still never waits behind a multi-minute
+// detail (the V3 poster problem). Proven against the real claim SQL.
+func TestQueue_ShortIntentsClaimedFirst(t *testing.T) {
+	st := freshStore(t)
+	ctx := context.Background()
+	assetID := seedAssetForQueue(t, st)
+
+	// Detail enqueued FIRST (older created), poster SECOND. By created-only order
+	// the detail would win; short-first must flip that.
+	if _, err := st.EnqueueJob(ctx, reconcileAccount, assetID, plate.Detail); err != nil {
+		t.Fatalf("enqueue detail: %v", err)
+	}
+	if _, err := st.EnqueueJob(ctx, reconcileAccount, assetID, plate.Poster); err != nil {
+		t.Fatalf("enqueue poster: %v", err)
+	}
+
+	first, err := st.ClaimNextJob(ctx, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if first.Intent != plate.Poster {
+		t.Fatalf("short-first: expected poster claimed before the older detail, got %q", first.Intent)
+	}
+	// The detail is next.
+	second, err := st.ClaimNextJob(ctx, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if second.Intent != plate.Detail {
+		t.Fatalf("expected detail second, got %q", second.Intent)
+	}
+}
+
+// A remux job (mode='remux', Tier 2 V4.1) is SHORT even when its intent is 'detail'
+// — an authored detail's remux carries intent 'detail' but must claim ahead of an
+// older DERIVED detail. Since the remux enqueue path lands in PR1, this seeds the
+// remux job directly via SQL to prove the claim order keys on MODE, not intent.
+func TestQueue_RemuxClaimedBeforeDerivedDetail(t *testing.T) {
+	st := freshStore(t)
+	ctx := context.Background()
+
+	// A derived detail, enqueued first (older).
+	derivedAsset := seedAssetForQueue(t, st)
+	if _, err := st.EnqueueJob(ctx, reconcileAccount, derivedAsset, plate.Detail); err != nil {
+		t.Fatalf("enqueue derived detail: %v", err)
+	}
+
+	// A remux detail on another asset, inserted directly (queued, mode='remux'),
+	// created LATER than the derived detail so created-order would rank it second.
+	remuxAsset := seedAssetForQueue(t, st)
+	remuxJobID := id.New()
+	if _, err := st.Pool().Exec(ctx, `
+		INSERT INTO jobs (id, account, asset, intent, status, mode, created)
+		VALUES ($1, $2, $3, 'detail', 'queued', 'remux', now() + interval '1 second')`,
+		remuxJobID, reconcileAccount, remuxAsset); err != nil {
+		t.Fatalf("insert remux job: %v", err)
+	}
+
+	// The remux (mode='remux', tier 0) must claim before the older derived detail
+	// (tier 2), despite being created later.
+	first, err := st.ClaimNextJob(ctx, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if first.Asset != remuxAsset {
+		t.Fatalf("remux (mode=remux) should claim before the older derived detail; got asset %s want %s", first.Asset, remuxAsset)
+	}
+}
+
 // A job that fails past maxAttempts is marked failed with a closed-enum reason
 // the delivery path can surface; below the ceiling it re-queues.
 func TestQueue_FailRetriesThenFails(t *testing.T) {

@@ -337,9 +337,10 @@ func (p *Postgres) AssetOwnedBy(ctx context.Context, account, assetID string) (b
 
 func (p *Postgres) CreateUpload(ctx context.Context, account string, u Upload) error {
 	_, err := p.pool.Exec(ctx, `
-		INSERT INTO uploads (id, account, key, content_type, size_bytes, filename, skip_derivations)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		u.ID, account, u.Key, u.ContentType, u.SizeBytes, nullStr(u.Filename), u.SkipDerivations)
+		INSERT INTO uploads (id, account, key, content_type, size_bytes, filename, skip_derivations, rendition_asset, rendition_intent)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		u.ID, account, u.Key, u.ContentType, u.SizeBytes, nullStr(u.Filename), u.SkipDerivations,
+		nullStr(u.RenditionAsset), nullStr(u.RenditionIntent))
 	if err != nil {
 		// A foreign-key violation on uploads.account means the account was never
 		// provisioned (`plate accounts create`) — a client/config error, not a
@@ -359,12 +360,14 @@ func (p *Postgres) GetUpload(ctx context.Context, account, uploadID string) (Upl
 	var (
 		u        Upload
 		filename *string
+		rAsset   *string
+		rIntent  *string
 	)
 	err := p.pool.QueryRow(ctx, `
-		SELECT id, account, key, content_type, size_bytes, filename, swept_at, skip_derivations
+		SELECT id, account, key, content_type, size_bytes, filename, swept_at, skip_derivations, rendition_asset, rendition_intent
 		FROM uploads
 		WHERE account = $1 AND id = $2`, account, uploadID).
-		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename, &u.SweptAt, &u.SkipDerivations)
+		Scan(&u.ID, &u.Account, &u.Key, &u.ContentType, &u.SizeBytes, &filename, &u.SweptAt, &u.SkipDerivations, &rAsset, &rIntent)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Upload{}, ErrNotFound
 	}
@@ -373,6 +376,12 @@ func (p *Postgres) GetUpload(ctx context.Context, account, uploadID string) (Upl
 	}
 	if filename != nil {
 		u.Filename = *filename
+	}
+	if rAsset != nil {
+		u.RenditionAsset = *rAsset
+	}
+	if rIntent != nil {
+		u.RenditionIntent = *rIntent
 	}
 	return u, nil
 }
@@ -592,6 +601,26 @@ func scanAssetRow(row rowScanner) (plate.Asset, error) {
 
 func (p *Postgres) renditionsFor(ctx context.Context, assetID string) ([]plate.Rendition, error) {
 	return renditionsForPool(ctx, p.pool, assetID)
+}
+
+// RenditionStatusFor returns the current status of one (asset, intent) rendition,
+// or ("", false) if no row exists. Used by the authored-rendition path (Tier 2
+// V4.1) to reject authoring over an existing `ready` rendition (409): replacing a
+// ready rendition is an explicit delete-then-author, not a silent overwrite. A
+// non-ready row (pending/failed/not_derived) does NOT block — authoring an intent
+// that failed or was declined is exactly the on-demand request that is allowed.
+func (p *Postgres) RenditionStatusFor(ctx context.Context, assetID string, intent plate.Intent) (plate.RenditionStatus, bool, error) {
+	var status string
+	err := p.pool.QueryRow(ctx, `
+		SELECT status FROM renditions WHERE asset = $1 AND intent = $2`,
+		assetID, string(intent)).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return plate.RenditionStatus(status), true, nil
 }
 
 func renditionsForPool(ctx context.Context, pool *pgxpool.Pool, assetID string) ([]plate.Rendition, error) {

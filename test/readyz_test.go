@@ -169,9 +169,13 @@ func TestReadyz_HeartbeatKeepsLastSweep(t *testing.T) {
 	}
 }
 
-// A queued job older than the lag threshold → degraded via the queue check,
-// even with a live worker (alive-but-stuck is still an incident).
-func TestReadyz_QueueLag_IsDegraded(t *testing.T) {
+// The queue check is now a NO-PROGRESS check (Tier 2 V4.1), not a wall-clock lag
+// ceiling: a non-empty queue is degraded only when nothing has progressed within
+// the window. This is the fix for the V4 finding — a healthy worker running one
+// long transcode let the oldest-queued age climb past the old 10m ceiling and
+// false-degraded. The pivot is proven by making the OLDEST-QUEUED AGE identical in
+// both directions and moving only the PROGRESS timestamp.
+func TestReadyz_QueueNoProgress_IsDegraded(t *testing.T) {
 	st := storeForTest(t)
 	resetHealthRows(t, st)
 	ctx := context.Background()
@@ -183,26 +187,65 @@ func TestReadyz_QueueLag_IsDegraded(t *testing.T) {
 		VALUES ('READYZASSET', $1, 'video', 'vault/x/READYZASSET', 'md5:0', 1)`, reconcileAccount); err != nil {
 		t.Fatal(err)
 	}
+	// A job queued 20 minutes ago with NO progress event — the stuck signal.
 	if _, err := st.Pool().Exec(ctx, `
-		INSERT INTO jobs (id, account, asset, intent, status, created)
-		VALUES ('READYZJOB', $1, 'READYZASSET', 'detail', 'queued', now() - interval '20 minutes')`, reconcileAccount); err != nil {
+		INSERT INTO jobs (id, account, asset, intent, status, created, updated)
+		VALUES ('READYZJOB', $1, 'READYZASSET', 'detail', 'queued', now() - interval '20 minutes', now() - interval '20 minutes')`, reconcileAccount); err != nil {
 		t.Fatal(err)
 	}
 
-	code, body := readyz(t, st, okStorage{}, service.HealthConfig{QueueLagMax: 10 * time.Minute})
+	cfg := service.HealthConfig{WorkerProgressWindow: 5 * time.Minute}
+	code, body := readyz(t, st, okStorage{}, cfg)
 	if code != http.StatusOK || body.Status != plate.Degraded {
-		t.Fatalf("lagging queue: want 200 degraded, got %d %s", code, body.Status)
+		t.Fatalf("stalled queue: want 200 degraded, got %d %s", code, body.Status)
 	}
-	if ok, d := okDetail(body.Checks.Queue); ok || !contains(d, "1 queued") {
-		t.Errorf("queue check should fail naming the backlog, got ok=%v %q", ok, d)
+	if ok, d := okDetail(body.Checks.Queue); ok || !contains(d, "1 queued") || !contains(d, "no progress") {
+		t.Errorf("queue check should fail naming the backlog + no-progress, got ok=%v %q", ok, d)
 	}
 	if ok, _ := okDetail(body.Checks.Worker); !ok {
-		t.Errorf("worker is live; only the queue should fail")
+		t.Errorf("worker heartbeat is live; only the queue should fail")
+	}
+}
+
+// The complement, and the whole point: the SAME 20-minute-old backlog is OK when a
+// worker is actively progressing a job (a long transcode heartbeating its lease).
+// A running job with a fresh heartbeat keeps LastProgress current, so the climbing
+// oldest-queued age is information, not an incident.
+func TestReadyz_LongRunningJob_StaysOk(t *testing.T) {
+	st := storeForTest(t)
+	resetHealthRows(t, st)
+	ctx := context.Background()
+	if err := st.UpsertWorkerHeartbeat(ctx, "machine-a", "img:1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool().Exec(ctx, `
+		INSERT INTO assets (id, account, kind, vault_key, vault_checksum, vault_size_bytes)
+		VALUES ('READYZASSET2', $1, 'video', 'vault/x/READYZASSET2', 'md5:0', 1)`, reconcileAccount); err != nil {
+		t.Fatal(err)
+	}
+	// A big detail claimed 20 min ago (so oldest activity is old) but heartbeating
+	// NOW — a genuinely long transcode — plus a second job queued behind it 20 min
+	// ago. Old backlog, but progress is fresh, so the check must stay ok.
+	if _, err := st.Pool().Exec(ctx, `
+		INSERT INTO jobs (id, account, asset, intent, status, created, locked_at, heartbeat_at, updated)
+		VALUES ('READYZRUN', $1, 'READYZASSET2', 'detail', 'running', now() - interval '20 minutes', now() - interval '20 minutes', now(), now())`, reconcileAccount); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool().Exec(ctx, `
+		INSERT INTO jobs (id, account, asset, intent, status, created, updated)
+		VALUES ('READYZWAIT', $1, 'READYZASSET2', 'poster', 'queued', now() - interval '20 minutes', now() - interval '20 minutes')`, reconcileAccount); err != nil {
+		t.Fatal(err)
 	}
 
-	// Same backlog, generous threshold → ok (lag is a threshold, not a count).
-	if _, body = readyz(t, st, okStorage{}, service.HealthConfig{QueueLagMax: time.Hour}); body.Status != plate.Ok {
-		t.Errorf("young backlog: want ok, got %s", body.Status)
+	cfg := service.HealthConfig{WorkerProgressWindow: 5 * time.Minute}
+	code, body := readyz(t, st, okStorage{}, cfg)
+	if code != http.StatusOK || body.Status != plate.Ok {
+		_, qd := okDetail(body.Checks.Queue)
+		t.Fatalf("long job progressing: want 200 ok, got %d %s (queue detail: %s)", code, body.Status, qd)
+	}
+	// The oldest-queued age is still REPORTED (information), even though ok.
+	if ok, d := okDetail(body.Checks.Queue); !ok || !contains(d, "queued") {
+		t.Errorf("queue check should be ok and still report the backlog as info, got ok=%v %q", ok, d)
 	}
 }
 

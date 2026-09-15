@@ -20,11 +20,18 @@ type WorkerLiveness struct {
 }
 
 // QueueLag is the job-queue backlog as /readyz reports it: how many jobs are
-// waiting and how old the oldest one is. A worker that is alive but stuck
-// shows up here (its heartbeat is fine, the queue is not).
+// waiting, how old the oldest one is (information), and when the worker last made
+// PROGRESS on any job. A backlog is only an incident when nothing is progressing —
+// a single long transcode keeps LastProgress fresh (it heartbeats its lease) while
+// the oldest-queued age climbs, and that is healthy, not stuck.
 type QueueLag struct {
 	Queued       int
 	OldestQueued *time.Time
+	// LastProgress is max(greatest(locked_at, heartbeat_at, updated)) across recent
+	// jobs — the last time a worker claimed, beat, completed, or failed anything.
+	// Nil when no job has ever run. A queue that is non-empty while this is stale is
+	// the real "stuck worker" signal, replacing the wall-clock lag ceiling.
+	LastProgress *time.Time
 }
 
 // Ping is the cheapest possible database reachability check (a round trip on
@@ -52,12 +59,20 @@ func (p *Postgres) WorkerLiveness(ctx context.Context) (WorkerLiveness, error) {
 	return wl, nil
 }
 
-// QueueLag counts queued jobs and finds the oldest. Running jobs are not lag —
-// they are being worked (their own lease heartbeat covers a stall).
+// QueueLag counts queued jobs, finds the oldest (information), and reads the most
+// recent job PROGRESS. Progress is max(greatest(locked_at, heartbeat_at, updated))
+// over jobs — every event a worker makes writes one of those (claim sets locked +
+// heartbeat, the beat refreshes heartbeat, complete/fail set updated). A live
+// worker mid-transcode keeps it fresh, so a long job never reads as a stall; a dead
+// or hung worker stops advancing it, which is the honest "stuck" signal.
 func (p *Postgres) QueueLag(ctx context.Context) (QueueLag, error) {
 	var ql QueueLag
 	err := p.pool.QueryRow(ctx, `
-		SELECT count(*), min(created) FROM jobs WHERE status = 'queued'`).Scan(&ql.Queued, &ql.OldestQueued)
+		SELECT
+			count(*) FILTER (WHERE status = 'queued'),
+			min(created) FILTER (WHERE status = 'queued'),
+			max(greatest(locked_at, heartbeat_at, updated))
+		FROM jobs`).Scan(&ql.Queued, &ql.OldestQueued, &ql.LastProgress)
 	if err != nil {
 		return QueueLag{}, err
 	}

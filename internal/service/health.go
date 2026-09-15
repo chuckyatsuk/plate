@@ -37,10 +37,14 @@ type HealthConfig struct {
 	// dead or stuck. Default 3× the worker's 30s beat = 90s… rounded up to 2m
 	// so a single missed beat during a deploy never pages.
 	WorkerStaleAfter time.Duration
-	// QueueLagMax: an oldest-queued job older than this means the queue is not
-	// draining. Default 10m (an image never queues; A/V jobs start within seconds
-	// when a worker is alive).
-	QueueLagMax time.Duration
+	// WorkerProgressWindow: the queue is "stuck" only when it is non-empty AND no
+	// job has made progress (been claimed, heartbeated, completed, or failed) within
+	// this window. Replaces the old wall-clock lag ceiling, which false-degraded on
+	// a healthy worker running one long transcode (the V4 finding: a single 1.3GB
+	// detail crossed a 10m oldest-queued ceiling while the worker was fine). A long
+	// job keeps progress fresh via its lease heartbeat; a dead/hung worker does not.
+	// Default 5m. The oldest-queued age stays in the detail string as INFORMATION.
+	WorkerProgressWindow time.Duration
 	// CheckTimeout bounds each dependency call so a hung Postgres cannot hang the
 	// probe (and the probe's caller). Default 2s.
 	CheckTimeout time.Duration
@@ -53,9 +57,9 @@ type HealthConfig struct {
 }
 
 const (
-	defaultWorkerStaleAfter = 2 * time.Minute
-	defaultQueueLagMax      = 10 * time.Minute
-	defaultCheckTimeout     = 2 * time.Second
+	defaultWorkerStaleAfter     = 2 * time.Minute
+	defaultWorkerProgressWindow = 5 * time.Minute
+	defaultCheckTimeout         = 2 * time.Second
 	// storageSentinelKey is HEADed to prove the bucket is reachable with valid
 	// credentials. It need not exist: a missing object is Exists=false with NO
 	// error; a bad endpoint or credential is an error. Outside every account
@@ -77,8 +81,8 @@ func newHealth(cfg HealthConfig, log *slog.Logger) *health {
 	if cfg.WorkerStaleAfter <= 0 {
 		cfg.WorkerStaleAfter = defaultWorkerStaleAfter
 	}
-	if cfg.QueueLagMax <= 0 {
-		cfg.QueueLagMax = defaultQueueLagMax
+	if cfg.WorkerProgressWindow <= 0 {
+		cfg.WorkerProgressWindow = defaultWorkerProgressWindow
 	}
 	if cfg.CheckTimeout <= 0 {
 		cfg.CheckTimeout = defaultCheckTimeout
@@ -183,10 +187,21 @@ func (s *Service) Readiness(ctx context.Context) (plate.Health, int) {
 		case ql.Queued == 0:
 			checks.Queue = check(true, "empty")
 		default:
+			// A non-empty queue is an incident only when NOTHING is progressing.
+			// The oldest-queued age is information (a long job legitimately lets it
+			// climb); the pass/fail signal is whether a worker has advanced ANY job
+			// within the progress window. A live worker mid-transcode heartbeats its
+			// lease, keeping LastProgress fresh; a dead/hung one lets it go stale.
 			age := time.Since(*ql.OldestQueued).Truncate(time.Second)
 			detail := fmt.Sprintf("%d queued, oldest %s", ql.Queued, age)
-			if age > h.cfg.QueueLagMax {
-				checks.Queue = check(false, detail+fmt.Sprintf(" (lag > %s)", h.cfg.QueueLagMax))
+			stuck := ql.LastProgress == nil ||
+				time.Since(*ql.LastProgress) > h.cfg.WorkerProgressWindow
+			if stuck {
+				noProgress := "no job has ever progressed"
+				if ql.LastProgress != nil {
+					noProgress = fmt.Sprintf("no progress in %s", time.Since(*ql.LastProgress).Truncate(time.Second))
+				}
+				checks.Queue = check(false, detail+" ("+noProgress+")")
 				degraded = true
 			} else {
 				checks.Queue = check(true, detail)

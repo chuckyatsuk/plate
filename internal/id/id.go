@@ -70,6 +70,11 @@ const (
 	VaultPrefix = "vault/"
 	// DeliveryPrefix is the publicly-readable home of derived renditions.
 	DeliveryPrefix = "delivery/"
+	// StagingPrefix is the never-public home of an AUTHORED rendition FILE (Tier 2
+	// V4.1) between its upload and the remux that copies it to the delivery key. On
+	// the vault side of the wall: it is a SOURCE, like an original, never served —
+	// the remux reads it and writes the public delivery object.
+	StagingPrefix = "staging/"
 )
 
 // VaultKey returns the storage key for an asset's vault original:
@@ -97,4 +102,14 @@ func RenditionKey(vaultKey, intent string) string {
 	// without the vault prefix degrades safely instead of corrupting.
 	rel := strings.TrimPrefix(vaultKey, VaultPrefix) // {account}/{asset}
 	return DeliveryPrefix + rel + "/" + intent
+}
+
+// StagingKey returns the storage key an AUTHORED rendition file is uploaded to
+// (Tier 2 V4.1): `staging/{account}/{asset-id}/{intent}`. The remux job reads this
+// object and writes the delivery key (RenditionKey). Never served — the staging
+// object is on the vault side of the wall, a source like an original. Per (asset,
+// intent), so a re-authored upload for the same intent overwrites its own staging
+// object rather than accumulating.
+func StagingKey(account, assetID, intent string) string {
+	return StagingPrefix + account + "/" + assetID + "/" + intent
 }

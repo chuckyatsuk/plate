@@ -813,6 +813,18 @@ components:
         - failed
         - not_derived
         - deleted
+        # Authored renditions (Tier 2 V4.1): a caller-supplied rendition file was
+        # refused because it breaks the intent's authored ceiling. Each names the
+        # single limit broken (first breach reported). Distinct from the DERIVED
+        # ceilings above: an authored detail has NO duration limit (the 12-min
+        # ceiling bounds Plate's transcode work, which authoring does not do), but
+        # IS bounded on codec, resolution, bitrate, size — and a loop keeps its 30s
+        # viewer cap.
+        - authored_codec_unsupported
+        - authored_resolution_exceeded
+        - authored_bitrate_exceeded
+        - authored_loop_too_long
+        - authored_too_large
 
     DeviceClass:
       type: string
@@ -1198,6 +1210,35 @@ components:
             no row at all — it enqueues, and the job's result replaces the row.
             The override lives at the point the request is made, not in a
             re-finalize path.
+        rendition:
+          $ref: '#/components/schemas/AuthoredRenditionBinding'
+          description: |
+            Authored rendition (Tier 2 V4.1). When present, this upload is the
+            FILE for a named rendition intent on an EXISTING asset — a studio's
+            own poster/loop/detail — not a new asset's original. Omit it (the
+            default) and the upload is an ordinary original, exactly as before.
+
+            The file is stream-copy REMUXED (faststart, no re-encode) and, on
+            passing the authored ceilings for the intent (codec/resolution/
+            bitrate, plus loop's 30s cap and a size backstop), stored as a
+            `ready` rendition. Zero transcode. A ceiling breach fails with a
+            naming reason (authored_codec_unsupported / authored_resolution_
+            exceeded / authored_bitrate_exceeded / authored_loop_too_long /
+            authored_too_large). An intent that already has a `ready` rendition
+            is rejected 409 — replace is an explicit delete-then-author.
+
+    AuthoredRenditionBinding:
+      type: object
+      additionalProperties: false
+      description: Binds an upload to an existing asset's rendition intent (Tier 2 V4.1 authored renditions).
+      required: [asset_id, intent]
+      properties:
+        asset_id:
+          $ref: '#/components/schemas/AssetId'
+          description: The existing asset this file is a rendition FOR. Must belong to the caller's account.
+        intent:
+          $ref: '#/components/schemas/Intent'
+          description: The rendition intent this file provides (detail, loop, or poster for a video; detail for audio).
 
     UploadTicket:
       type: object

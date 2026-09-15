@@ -102,6 +102,11 @@ type Store interface {
 	// finalizeUpload) before doing their work.
 	AssetOwnedBy(ctx context.Context, account, assetID string) (bool, error)
 
+	// RenditionStatusFor returns one (asset, intent) rendition's status, or
+	// ("", false) if no row exists. The authored-rendition path (Tier 2 V4.1) uses
+	// it to reject authoring over an existing `ready` rendition (409).
+	RenditionStatusFor(ctx context.Context, assetID string, intent plate.Intent) (plate.RenditionStatus, bool, error)
+
 	// ── exports (Tier 1: the export capability) ─────────────────────────────
 
 	// GetExport returns an export if it belongs to account; otherwise ErrNotFound.
@@ -157,6 +162,12 @@ type Store interface {
 	// Idempotent per (asset, intent). Account-scoped; the caller confirms
 	// ownership before enqueue.
 	EnqueueJob(ctx context.Context, account, assetID string, intent plate.Intent) (plate.Job, error)
+
+	// EnqueueRemuxJob queues a REMUX job for an authored rendition (Tier 2 V4.1):
+	// mode='remux', reading the authored file at sourceKey and copying it into the
+	// intent's delivery object. Idempotent per (asset, intent); a re-authored intent
+	// re-points the existing non-failed job at the new staging file.
+	EnqueueRemuxJob(ctx context.Context, account, assetID string, intent plate.Intent, sourceKey string) (plate.Job, error)
 
 	// MarkNotDerived records an intent as terminally not-derived-automatically,
 	// for an upload that declined derivation (skip_derivations). Never
@@ -217,6 +228,13 @@ type Upload struct {
 	// different requests), so it rides on the upload row in between: no auto
 	// enqueue, and every derivable intent recorded `not_derived` instead.
 	SkipDerivations bool
+	// RenditionAsset + RenditionIntent bind an AUTHORED-RENDITION upload (Tier 2
+	// V4.1) to the asset + intent it provides a file for. Both empty for an
+	// ordinary original upload. When set, finalize enqueues a `remux` job that
+	// stream-copies this file into the intent's delivery object instead of
+	// creating a new asset. Rides the row for the same reason SkipDerivations does.
+	RenditionAsset  string
+	RenditionIntent string
 	// SweptAt is set once the reconcile sweep has reclaimed this upload's orphaned
 	// object. A non-nil SweptAt means the bytes are gone: finalize must refuse
 	// (410), not treat it as a never-uploaded 409.

@@ -26,6 +26,13 @@ type ClaimedJob struct {
 	Intent   plate.Intent
 	VaultKey string // the asset's {account}/{asset-id} storage key — the transcode source
 	Attempts int32
+	// Mode is 'derive' (transcode the vault original) or 'remux' (stream-copy an
+	// authored file — Tier 2 V4.1). Empty is treated as 'derive' by the worker.
+	Mode string
+	// SourceKey is a remux job's source: the staging key the authored file landed
+	// at. Empty for a derive job (which reads VaultKey). The worker reads SourceKey
+	// when set, VaultKey otherwise.
+	SourceKey string
 }
 
 // ErrNoJob is returned by ClaimNextJob when the queue has nothing runnable.
@@ -70,6 +77,56 @@ func (p *Postgres) EnqueueJob(ctx context.Context, account, assetID string, inte
 	return scanJobBasic(row)
 }
 
+// EnqueueRemuxJob inserts a queued REMUX job for an AUTHORED rendition (Tier 2
+// V4.1): mode='remux', source_key = the staging key the authored file landed at.
+// The worker stream-copies that file into the intent's delivery object instead of
+// transcoding the vault original. Account-scoped; the asset must belong to the
+// caller (verified before enqueue). Idempotent per (asset, intent) like EnqueueJob:
+// a re-authored intent whose prior job is non-failed returns it, and its
+// source_key is updated to the new staging file so the re-run reads the fresh
+// upload (an authored intent whose old job is queued/running but whose file was
+// re-uploaded must remux the NEW bytes).
+func (p *Postgres) EnqueueRemuxJob(ctx context.Context, account, assetID string, intent plate.Intent, sourceKey string) (plate.Job, error) {
+	var (
+		j        plate.Job
+		existing bool
+	)
+	err := p.pool.QueryRow(ctx, `
+		SELECT id, asset, intent, status, retries
+		FROM jobs
+		WHERE account = $1 AND asset = $2 AND intent = $3
+		ORDER BY created DESC LIMIT 1`, account, assetID, string(intent)).
+		Scan(&j.Id, &j.Asset, &j.Intent, &j.Status, &j.Retries)
+	switch {
+	case err == nil:
+		existing = true
+	case errors.Is(err, pgx.ErrNoRows):
+		existing = false
+	default:
+		return plate.Job{}, err
+	}
+
+	if existing && j.Status != plate.JobStatus("failed") {
+		// Re-point the existing non-failed job at the freshly-uploaded staging file
+		// and ensure it is a remux — the author just replaced the source bytes.
+		if _, err := p.pool.Exec(ctx, `
+			UPDATE jobs SET source_key = $1, mode = 'remux', updated = now()
+			WHERE id = $2`, sourceKey, j.Id); err != nil {
+			return plate.Job{}, err
+		}
+		j.Status = plate.JobStatus("queued")
+		return j, nil
+	}
+
+	jobID := id.New()
+	row := p.pool.QueryRow(ctx, `
+		INSERT INTO jobs (id, account, asset, intent, status, mode, source_key)
+		VALUES ($1, $2, $3, $4, 'queued', 'remux', $5)
+		RETURNING id, asset, intent, status, retries, created, updated`,
+		jobID, account, assetID, string(intent), sourceKey)
+	return scanJobBasic(row)
+}
+
 // ClaimNextJob atomically claims the oldest queued job (or a job whose lease has
 // expired — a worker that died mid-job). It marks the job running, stamps the
 // lease, bumps attempts, and returns it with the asset's vault key. ErrNoJob when
@@ -92,19 +149,37 @@ func (p *Postgres) ClaimNextJob(ctx context.Context, leaseTTL time.Duration) (Cl
 			SELECT id FROM jobs
 			WHERE status = 'queued'
 			   OR (status = 'running' AND heartbeat_at < $1)
-			ORDER BY created
+			-- SHORT work first, then oldest (Tier 2 V4.1). A remux (stream-copy of
+			-- an authored file) and a poster are seconds; a loop is short; a derived
+			-- detail is minutes. Claiming detail ahead of them is the poster problem
+			-- (V3): the quick job waits behind a long transcode and the still/remux
+			-- lands late. Tiers: remux + poster = 0, loop = 1, derived detail = 2.
+			-- Keyed on MODE (not intent) for remux, because an authored detail's
+			-- remux job carries intent 'detail' -- only the mode column tells them apart.
+			ORDER BY (CASE
+			              WHEN mode = 'remux'     THEN 0
+			              WHEN intent = 'poster'  THEN 0
+			              WHEN intent = 'loop'    THEN 1
+			              ELSE 2
+			          END), created
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING id, account, asset, intent, retries`,
+		RETURNING id, account, asset, intent, retries, mode, source_key`,
 		staleBefore)
 
-	var cj ClaimedJob
-	if err := row.Scan(&cj.ID, &cj.Account, &cj.Asset, &cj.Intent, &cj.Attempts); err != nil {
+	var (
+		cj        ClaimedJob
+		sourceKey *string
+	)
+	if err := row.Scan(&cj.ID, &cj.Account, &cj.Asset, &cj.Intent, &cj.Attempts, &cj.Mode, &sourceKey); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ClaimedJob{}, ErrNoJob
 		}
 		return ClaimedJob{}, err
+	}
+	if sourceKey != nil {
+		cj.SourceKey = *sourceKey
 	}
 
 	// Fetch the asset's vault key (the transcode source), scoped to the job's
