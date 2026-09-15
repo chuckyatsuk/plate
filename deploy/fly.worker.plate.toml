@@ -1,0 +1,60 @@
+# Plate worker — PRODUCTION (Tier 4). Deploys ONLY the worker (`plate work`); the API
+# has its own manifest (fly.api.plate.toml). Both point at the same Postgres + the
+# `plate` R2 bucket.
+#
+# Production successor to deploy/fly.toml (plate-demo-worker). Differences:
+#   - app = "plate-worker" (was plate-demo-worker)
+#   - NO PLATE_ALLOW_THROWAWAY_KEYS — prod keypair; the boot guard stays armed.
+#   - R2_DEFAULT_BUCKET = plate (secret, below).
+#
+# Deploy + keep one machine up (the process group is "worker", not "app"):
+#   fly deploy . -a plate-worker -c deploy/fly.worker.plate.toml
+#   fly scale count worker=1 -a plate-worker
+
+app = "plate-worker"
+primary_region = "iad"  # co-locate with the Postgres region (grant/queue lookups in-region)
+
+[build]
+  # Relative to deploy/; ../ reaches the repo root. Deploy with the repo root as
+  # context: `fly deploy . -c deploy/fly.worker.plate.toml` (Dockerfile.worker COPYs the module).
+  dockerfile = "../Dockerfile.worker"
+
+[processes]
+  worker = "work"
+
+# The transcode workload is bursty ingest, idle most of the time. But the worker ALSO
+# runs the reconciliation sweep loop (orphaned uploads + deleted-asset purge) on a
+# ticker in-process — scaling to zero would SILENTLY stop reconciliation, letting
+# orphaned R2 objects and marked-deleted bytes accumulate forever with no error. So
+# keep one machine always running (enforced at deploy with `fly scale count worker=1`).
+[[vm]]
+  # PERFORMANCE CPU, never shared: ffmpeg on a throttled shared vCPU crawls and would
+  # blow the duration ceilings. 2 perf CPU / 4GB — a 12-min derived source is ~30min of
+  # compute. Tier 4 note: Uri's backfill is AUTHORED (remux, seconds) + one tiny derive,
+  # so the perf machine is barely taxed — but it MUST stay perf-2x because live post-
+  # cutover uploads (V3 ingest) can still enqueue a real derived detail.
+  size = "performance-2x"
+  memory = "4gb"
+
+# Scratch: prefer the machine's ephemeral disk over a Fly Volume (a Volume bills
+# whether attached or not). PLATE_WORKER_SCRATCH_DIR is set in the image.
+
+# Secrets (set with `fly secrets set -a plate-worker …`, NEVER committed):
+#   DATABASE_URL   — the IPv4 SESSION pooler DSN (postgres.<ref>@aws-0-…pooler:5432,
+#                    ?sslmode=require). The direct db.<ref>.supabase.co host is IPv6-ONLY;
+#                    the worker's SKIP LOCKED needs session semantics, which the 5432
+#                    session pooler (NOT the 6543 txn pooler) preserves.
+#   R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_REGION   (same account as demo)
+#   R2_DEFAULT_BUCKET = plate    ⚠️ the NEW prod bucket (NOT plate-demo)
+# The worker needs NO JWT/delivery/imgproxy keys — it pulls jobs + writes renditions;
+# it never validates tokens or mints delivery URLs. ffmpeg/ffprobe are on PATH in the
+# image (no PLATE_FFMPEG_PATH needed).
+[env]
+  PLATE_ENV = "production"
+  PLATE_LOG_LEVEL = "info"
+  PLATE_WORKER_CONCURRENCY = "1"
+  # (PLATE_WORKER_PROGRESS_WINDOW belongs to the API's readyz check, not the worker —
+  #  internal/service/config.go reads it; it defaults to 5m in code. Not set here.)
+  # NO PLATE_ALLOW_THROWAWAY_KEYS (unlike the demo): the worker builds the service
+  # from the same key material as the API, so it hits the same boot guard — and prod
+  # keeps it ARMED on a freshly generated keypair (Phase B).

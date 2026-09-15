@@ -1,0 +1,83 @@
+# Plate API — PRODUCTION (Tier 4). The `plate-*` app set that Uri's live site and the
+# demo both run on. Deploys the API (`plate serve`); the worker is a SEPARATE app
+# (deploy/fly.worker.plate.toml). Two apps, not two process groups, so each scales and
+# sizes independently: the API is light and latency-sensitive (it also serves the
+# granted-mode /v1/download byte-edge redirect), the worker is heavy ffmpeg compute.
+#
+# This is the production successor to deploy/fly.api.toml (plate-demo-api). Differences:
+#   - app = "plate-api" (was plate-demo-api)
+#   - NO PLATE_ALLOW_THROWAWAY_KEYS — prod uses the real Phase-B keypair; the
+#     known-throwaway-key boot guard MUST be armed (a real client on real keys).
+#   - Secrets carry the `plate` bucket + plate-media/plate-img hosts (see checklist).
+#
+# ⚠️ Secrets are set with `fly secrets set` (NEVER committed). See the checklist below.
+
+app = "plate-api"
+primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download grant
+                        # liveness lookup and every store query hit Postgres in-region.
+
+[build]
+  # Path is relative to THIS config file's dir (deploy/), so ../ reaches the repo
+  # root where the Dockerfiles live. Deploy with the repo root as the build
+  # context: `fly deploy . -c deploy/fly.api.plate.toml` (the Dockerfiles COPY . .
+  # the whole Go module, so the context MUST be the root, not deploy/).
+  dockerfile = "../Dockerfile"  # the API image (no ffmpeg)
+
+[env]
+  PLATE_ENV = "production"
+  PLATE_LOG_LEVEL = "info"
+  PLATE_HTTP_ADDR = ":8080"
+  # NO PLATE_ALLOW_THROWAWAY_KEYS here (unlike the demo): prod runs on a freshly
+  # generated keypair (Phase B), so the throwaway-key boot guard stays ARMED. Setting
+  # it would defeat the guard that protects a real client's credential.
+
+# Public HTTP service. Unlike the worker, the API serves requests — presign,
+# finalize, resolve, and the /v1/download redirect.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"   # scale to zero when idle
+  auto_start_machines = true    # wake on the first request
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/v1/readyz"          # REAL (Tier 1 monitoring): db ping + storage HEAD → 503 "down"
+                                 # (pulls the machine from routing); worker-heartbeat / no-progress
+                                 # problems are 200 "degraded" so a dead worker never unroutes the
+                                 # API. The EXTERNAL monitor alerts on non-200 OR status != ok.
+                                 # NOTE (Tier 4): between deploy and Phase B2, the API has NO JWT key
+                                 # material and 401s every token — that is EXPECTED and does NOT affect
+                                 # readyz (token validation is not a readyz check). readyz is 200/ok.
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[vm]]
+  # The API is light: no ffmpeg, just HTTP + Postgres + presign/redirect. A shared
+  # CPU is fine here (the performance-CPU rule is a WORKER constraint — ffmpeg on a
+  # throttled vCPU crawls; the API does no such work).
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# ── Secrets checklist (fly secrets set -a plate-api …) ───────────────────────
+# Required (API 503s the write path / denies tokens without these):
+#   DATABASE_URL                 the IPv4 SESSION pooler DSN (direct host is IPv6-only)
+#   R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_REGION   (same account as demo)
+#   R2_DEFAULT_BUCKET = plate    ⚠️ the NEW prod bucket (NOT plate-demo)
+#   PLATE_JWT_PUBLIC_KEYS        named-key set `kid=<b64pub> …` — set in PHASE B2 with
+#                                BOTH files-20260914 (demo self-mint) AND uri-YYYYMMDD
+#                                (the client). EMPTY until B2 → API denies all tokens
+#                                (expected, see the readyz note above).
+# Delivery (granted/signed/original — set so the byte edge is enforceable):
+#   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download — a REAL prod secret (A2),
+#                                NOT the demo throwaway
+#   IMGPROXY_KEY IMGPROXY_SALT   hex — REAL prod values (A2); MUST match plate-imgproxy
+#   IMGPROXY_BASE_URL = https://plate-img.everysinglefile.com   the CDN-fronted imgproxy
+#                                host (Cloudflare → plate-imgproxy.fly.dev, cache rule).
+#   R2_PUBLIC_BASE   = https://plate-media.everysinglefile.com  the `plate` bucket's A/V
+#                                public custom domain (loops/details/original bytes).
+#   PLATE_DOWNLOAD_BASE = https://plate-api.fly.dev             this API's own public base.
+# Optional tunables (safe defaults):
+#   PLATE_GRANTED_URL_TTL (<=120s), PLATE_GRANT_CACHE_TTL, PLATE_UPLOAD_URL_TTL,
+#   PLATE_JWT_ISSUER, PLATE_JWT_AUDIENCE
