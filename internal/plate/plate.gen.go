@@ -159,19 +159,34 @@ func (e MediaKind) Valid() bool {
 
 // Defines values for ReasonCode.
 const (
-	ReasonCodeDeleted                 ReasonCode = "deleted"
-	ReasonCodeExceededDurationCeiling ReasonCode = "exceeded_duration_ceiling"
-	ReasonCodeExceededSizeCeiling     ReasonCode = "exceeded_size_ceiling"
-	ReasonCodeFailed                  ReasonCode = "failed"
-	ReasonCodeNotDerived              ReasonCode = "not_derived"
-	ReasonCodePending                 ReasonCode = "pending"
-	ReasonCodeUnauthorized            ReasonCode = "unauthorized"
-	ReasonCodeUnsupportedFormat       ReasonCode = "unsupported_format"
+	ReasonCodeAuthoredBitrateExceeded    ReasonCode = "authored_bitrate_exceeded"
+	ReasonCodeAuthoredCodecUnsupported   ReasonCode = "authored_codec_unsupported"
+	ReasonCodeAuthoredLoopTooLong        ReasonCode = "authored_loop_too_long"
+	ReasonCodeAuthoredResolutionExceeded ReasonCode = "authored_resolution_exceeded"
+	ReasonCodeAuthoredTooLarge           ReasonCode = "authored_too_large"
+	ReasonCodeDeleted                    ReasonCode = "deleted"
+	ReasonCodeExceededDurationCeiling    ReasonCode = "exceeded_duration_ceiling"
+	ReasonCodeExceededSizeCeiling        ReasonCode = "exceeded_size_ceiling"
+	ReasonCodeFailed                     ReasonCode = "failed"
+	ReasonCodeNotDerived                 ReasonCode = "not_derived"
+	ReasonCodePending                    ReasonCode = "pending"
+	ReasonCodeUnauthorized               ReasonCode = "unauthorized"
+	ReasonCodeUnsupportedFormat          ReasonCode = "unsupported_format"
 )
 
 // Valid indicates whether the value is a known member of the ReasonCode enum.
 func (e ReasonCode) Valid() bool {
 	switch e {
+	case ReasonCodeAuthoredBitrateExceeded:
+		return true
+	case ReasonCodeAuthoredCodecUnsupported:
+		return true
+	case ReasonCodeAuthoredLoopTooLong:
+		return true
+	case ReasonCodeAuthoredResolutionExceeded:
+		return true
+	case ReasonCodeAuthoredTooLarge:
+		return true
 	case ReasonCodeDeleted:
 		return true
 	case ReasonCodeExceededDurationCeiling:
@@ -290,6 +305,17 @@ type AssetPage struct {
 
 	// NextCursor Opaque cursor for the next page, or null when exhausted.
 	NextCursor *string `json:"next_cursor,omitempty"`
+}
+
+// AuthoredRenditionBinding Binds an upload to an existing asset's rendition intent (Tier 2 V4.1 authored renditions).
+type AuthoredRenditionBinding struct {
+	// AssetId The existing asset this file is a rendition FOR. Must belong to the caller's account.
+	//
+	// Examples: 01J9Z0K3Q4XR7NB8YF2WV6TCEH
+	AssetId AssetId `json:"asset_id"`
+
+	// Intent The rendition intent this file provides (detail, loop, or poster for a video; detail for audio).
+	Intent Intent `json:"intent"`
 }
 
 // Delivery A resolved, browser-reachable delivery URL and the bounds it was clamped to.
@@ -744,6 +770,21 @@ type UploadRequest struct {
 
 	// Filename Optional human-readable name, recorded as metadata.
 	Filename *string `json:"filename,omitempty"`
+
+	// Rendition Authored rendition (Tier 2 V4.1). When present, this upload is the
+	// FILE for a named rendition intent on an EXISTING asset — a studio's
+	// own poster/loop/detail — not a new asset's original. Omit it (the
+	// default) and the upload is an ordinary original, exactly as before.
+	//
+	// The file is stream-copy REMUXED (faststart, no re-encode) and, on
+	// passing the authored ceilings for the intent (codec/resolution/
+	// bitrate, plus loop's 30s cap and a size backstop), stored as a
+	// `ready` rendition. Zero transcode. A ceiling breach fails with a
+	// naming reason (authored_codec_unsupported / authored_resolution_
+	// exceeded / authored_bitrate_exceeded / authored_loop_too_long /
+	// authored_too_large). An intent that already has a `ready` rendition
+	// is rejected 409 — replace is an explicit delete-then-author.
+	Rendition *AuthoredRenditionBinding `json:"rendition,omitempty"`
 
 	// SizeBytes Exact declared byte size. Bound into the presigned PUT's signature as the exact content-length — the object must be exactly this many bytes (a presigned PUT signs an exact length, not a range).
 	SizeBytes int64 `json:"size_bytes"`

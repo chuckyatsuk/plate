@@ -196,6 +196,14 @@ func (w *Worker) process(ctx context.Context, job store.ClaimedJob) error {
 	srcPath := filepath.Join(work, "source")
 	dstPath := filepath.Join(work, "rendition"+outputExt(job.Intent))
 
+	// AUTHORED RENDITION (Tier 2 V4.1): a remux job stream-copies an authored file
+	// into the intent's delivery object. Different source (the staging key, not the
+	// vault original), different bounds (the authored ceilings, not the derived
+	// duration ceiling), and no transcode. Handled in its own path.
+	if job.Mode == "remux" {
+		return w.processRemux(ctx, job, work, srcPath, dstPath)
+	}
+
 	// Pull the vault original from storage (server-to-server; the worker holds the
 	// derivative-path credentials, spec §5.1).
 	if err := w.download(ctx, job.VaultKey, srcPath); err != nil {
@@ -258,6 +266,147 @@ func (w *Worker) process(ctx context.Context, job store.ClaimedJob) error {
 	rend.Mode = string(plate.Public)
 
 	return w.store.CompleteJob(ctx, job.ID, rend)
+}
+
+// Authored-rendition ceilings (Tier 2 V4.1, chuck's ruling). An authored detail
+// has NO duration limit (the derived 12-min ceiling bounds Plate's transcode work,
+// which authoring does not do), but IS bounded on codec/resolution/bitrate/size; a
+// loop keeps its 30s VIEWER cap (a grid of autoplaying tiles) even when authored.
+const (
+	authoredDetailMaxWidth  = 1920
+	authoredDetailMaxHeight = 1080
+	authoredLoopMaxEdge     = 640
+	authoredLoopMaxDuration = 30.0              // seconds — viewer cap, not compute
+	authoredDetailMaxBPS    = 8 * 1_000_000     // 8 Mbps
+	authoredLoopMaxBPS      = 2 * 1_000_000     // 2 Mbps
+	authoredMaxBytes        = 2 * 1024 * 1024 * 1024 // 2 GiB storage backstop
+)
+
+// processRemux handles an authored rendition: pull the staged file, probe it,
+// enforce the authored ceilings for the intent, and — on a pass — stream-copy it
+// (faststart) into the intent's delivery object. A ceiling breach is a job SUCCESS
+// with a FAILED rendition carrying the naming reason (the honest refusal), exactly
+// like the derived duration-ceiling refusal — not a job failure to retry.
+func (w *Worker) processRemux(ctx context.Context, job store.ClaimedJob, work, srcPath, dstPath string) error {
+	if job.SourceKey == "" {
+		return fmt.Errorf("remux job %s has no source_key", job.ID)
+	}
+	// Pull the authored file from its staging key (vault side; server-to-server).
+	if err := w.download(ctx, job.SourceKey, srcPath); err != nil {
+		return fmt.Errorf("pull authored file: %w", err)
+	}
+
+	pr, err := w.prober.ProbeAV(ctx, srcPath)
+	if err != nil {
+		// An unprobeable authored file is a refusal, not a crash: the studio gave
+		// us bytes we cannot read as A/V. Record it as an unsupported format.
+		if rerr := w.store.FailedRenditionForCeiling(ctx, job.Asset, job.Intent, plate.ReasonCodeAuthoredCodecUnsupported); rerr != nil {
+			return fmt.Errorf("write authored-refusal rendition: %w", rerr)
+		}
+		return w.store.CompleteJobNoRendition(ctx, job.ID)
+	}
+
+	// Enforce the authored ceilings. A breach names the single limit broken.
+	if reason, ok := authoredCeilingBreach(job.Intent, pr); !ok {
+		w.log.Info("authored rendition refused",
+			"asset", job.Asset, "intent", job.Intent, "reason", reason)
+		if rerr := w.store.FailedRenditionForCeiling(ctx, job.Asset, job.Intent, reason); rerr != nil {
+			return fmt.Errorf("write authored-refusal rendition: %w", rerr)
+		}
+		return w.store.CompleteJobNoRendition(ctx, job.ID)
+	}
+
+	// Passed. Remux (stream-copy + faststart) into the rendition object. Short job,
+	// but heartbeat anyway so a large file's copy does not lose its lease.
+	beat, stopBeat := context.WithCancel(ctx)
+	defer stopBeat()
+	go w.heartbeatLoop(beat, job.ID)
+	if err := w.transcoder.Remux(ctx, srcPath, dstPath); err != nil {
+		return fmt.Errorf("remux authored file: %w", err)
+	}
+	stopBeat()
+
+	// Record the rendition from the PROBED source facts (the remux is a copy, so
+	// the delivery object's dims/duration/audio equal the source's).
+	rendKey := renditionKey(job.VaultKey, job.Intent)
+	if err := w.upload(ctx, dstPath, rendKey, contentType(job.Intent)); err != nil {
+		return fmt.Errorf("put authored rendition: %w", err)
+	}
+	rec := store.RenditionRecord{Key: rendKey, Mode: string(plate.Public)}
+	if pr.Width > 0 {
+		rec.Width = ptrInt32(pr.Width)
+	}
+	if pr.Height > 0 {
+		rec.Height = ptrInt32(pr.Height)
+	}
+	if pr.DurationS > 0 {
+		d := pr.DurationS
+		rec.DurationS = &d
+	}
+	hasAudio := pr.AudioCodec != ""
+	rec.HasAudio = &hasAudio
+	return w.store.CompleteJob(ctx, job.ID, rec)
+}
+
+// authoredCeilingBreach checks an authored rendition file against its intent's
+// ceilings. Returns (reason, false) on the FIRST breach, ("", true) when it passes.
+// A missing bitrate (0) is treated as unknown and does not trip the bitrate cap —
+// the size backstop still applies.
+func authoredCeilingBreach(intent plate.Intent, pr probe.Result) (plate.ReasonCode, bool) {
+	// Size backstop applies to every authored intent.
+	if pr.BitrateBPS > 0 && pr.DurationS > 0 {
+		estBytes := int64(float64(pr.BitrateBPS) / 8 * pr.DurationS)
+		if estBytes > authoredMaxBytes {
+			return plate.ReasonCodeAuthoredTooLarge, false
+		}
+	}
+
+	switch intent {
+	case plate.Detail:
+		// H.264 video + AAC audio, ≤1080p, ≤8 Mbps.
+		if !isH264(pr.Codec) {
+			return plate.ReasonCodeAuthoredCodecUnsupported, false
+		}
+		if pr.AudioCodec != "" && !isAAC(pr.AudioCodec) {
+			return plate.ReasonCodeAuthoredCodecUnsupported, false
+		}
+		if pr.Width > authoredDetailMaxWidth || pr.Height > authoredDetailMaxHeight {
+			return plate.ReasonCodeAuthoredResolutionExceeded, false
+		}
+		if pr.BitrateBPS > authoredDetailMaxBPS {
+			return plate.ReasonCodeAuthoredBitrateExceeded, false
+		}
+	case plate.Loop:
+		// H.264, SILENT, ≤640px long edge, ≤30s, ≤2 Mbps.
+		if !isH264(pr.Codec) {
+			return plate.ReasonCodeAuthoredCodecUnsupported, false
+		}
+		if longEdge(pr.Width, pr.Height) > authoredLoopMaxEdge {
+			return plate.ReasonCodeAuthoredResolutionExceeded, false
+		}
+		if pr.DurationS > authoredLoopMaxDuration {
+			return plate.ReasonCodeAuthoredLoopTooLong, false
+		}
+		if pr.BitrateBPS > authoredLoopMaxBPS {
+			return plate.ReasonCodeAuthoredBitrateExceeded, false
+		}
+	case plate.Poster:
+		// A poster authored as a video-container frame is unusual; the common case
+		// is an image, which does not take this A/V path. Bound resolution only.
+		if pr.Width > authoredDetailMaxWidth || pr.Height > authoredDetailMaxHeight {
+			return plate.ReasonCodeAuthoredResolutionExceeded, false
+		}
+	}
+	return "", true
+}
+
+func isH264(codec string) bool { return codec == "h264" }
+func isAAC(codec string) bool   { return codec == "aac" }
+func longEdge(w, h int) int {
+	if w > h {
+		return w
+	}
+	return h
 }
 
 func (w *Worker) heartbeatLoop(ctx context.Context, jobID string) {

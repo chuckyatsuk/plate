@@ -33,6 +33,13 @@ type Transcoder interface {
 	// dir is created if needed. It returns an error on any ffmpeg failure or an
 	// unsupported intent.
 	Transcode(ctx context.Context, intent plate.Intent, src, dst string) error
+
+	// Remux stream-copies src to dst (no re-encode) with faststart applied — the
+	// authored-rendition path (Tier 2 V4.1). Seconds, not minutes: the codecs are
+	// already web-safe (enforced by the authored ceilings before this runs), so the
+	// only work is the container + moov placement. dst's parent dir is created if
+	// needed.
+	Remux(ctx context.Context, src, dst string) error
 }
 
 // FFmpegTranscoder is the real Transcoder, shelling to ffmpeg.
@@ -81,6 +88,23 @@ func (t *FFmpegTranscoder) Transcode(ctx context.Context, intent plate.Intent, s
 	cmd := exec.CommandContext(cctx, t.ffmpegPath, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("worker: ffmpeg %s failed: %w\n%s", intent, err, out)
+	}
+	return nil
+}
+
+// Remux stream-copies src to dst with faststart (the authored-rendition path,
+// Tier 2 V4.1), using the shared mediaspec.RemuxCopyArgs so the copy path produces
+// the SAME faststart artifact the transcode path does. No re-encode: the authored
+// ceilings already confirmed the codecs are web-safe.
+func (t *FFmpegTranscoder) Remux(ctx context.Context, src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("worker: mkdir remux dst: %w", err)
+	}
+	cctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, t.ffmpegPath, mediaspec.RemuxCopyArgs(src, dst)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("worker: ffmpeg remux failed: %w\n%s", err, out)
 	}
 	return nil
 }

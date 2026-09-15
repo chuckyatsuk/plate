@@ -49,8 +49,16 @@ type Result struct {
 	Width     int
 	Height    int
 	DurationS float64
-	Codec     string
+	Codec     string // the VIDEO stream's codec (or the audio codec for audio-only)
 	Container string
+	// AudioCodec is the first audio stream's codec when a video stream is also
+	// present (e.g. "aac"), empty when there is no audio. Populated for the
+	// authored-rendition ceiling checks (Tier 2 V4.1: detail must be H.264+AAC).
+	// For an audio-only file the codec lands in Codec, as before.
+	AudioCodec string
+	// BitrateBPS is the overall (format) bitrate in bits per second, 0 when
+	// ffprobe did not report it. Drives the authored-rendition bitrate cap.
+	BitrateBPS int64
 }
 
 // Prober reads object properties. Split so the image path needs no external
@@ -124,7 +132,7 @@ func (p *Prober) ProbeAV(ctx context.Context, path string) (Result, error) {
 	defer cancel()
 	cmd := exec.CommandContext(cctx, p.ffprobePath,
 		"-hide_banner", "-v", "error",
-		"-show_entries", "format=duration,format_name",
+		"-show_entries", "format=duration,format_name,bit_rate",
 		"-show_entries", "stream=codec_name,width,height,codec_type",
 		"-of", "json", path,
 	)
@@ -137,6 +145,7 @@ func (p *Prober) ProbeAV(ctx context.Context, path string) (Result, error) {
 		Format struct {
 			Duration   string `json:"duration"`
 			FormatName string `json:"format_name"`
+			BitRate    string `json:"bit_rate"`
 		} `json:"format"`
 		Streams []struct {
 			CodecName string `json:"codec_name"`
@@ -155,6 +164,14 @@ func (p *Prober) ProbeAV(ctx context.Context, path string) (Result, error) {
 			res.DurationS = d
 		}
 	}
+	// Overall bitrate (bits/sec) for the authored-rendition cap. ffprobe reports it
+	// as a decimal string; absent/unparseable → 0 (the ceiling check treats 0 as
+	// "unknown" and does not refuse on it — the size backstop still applies).
+	if parsed.Format.BitRate != "" {
+		if b, err := strconv.ParseInt(parsed.Format.BitRate, 10, 64); err == nil {
+			res.BitrateBPS = b
+		}
+	}
 	hasVideo := false
 	for _, s := range parsed.Streams {
 		if s.CodecType == "video" {
@@ -167,6 +184,16 @@ func (p *Prober) ProbeAV(ctx context.Context, path string) (Result, error) {
 	// image frame in a video container is rare here and treated as video.)
 	if hasVideo {
 		res.Kind = plate.Video
+		// Capture the FIRST audio stream's codec alongside the video (the authored
+		// detail check needs H.264 video + AAC audio, and has_audio gates the
+		// lightbox speaker). Empty when the video is silent — which is exactly what
+		// an authored loop must be.
+		for _, s := range parsed.Streams {
+			if s.CodecType == "audio" {
+				res.AudioCodec = s.CodecName
+				break
+			}
+		}
 	} else {
 		res.Kind = plate.Audio
 		// Audio-only: take the first audio stream's codec.

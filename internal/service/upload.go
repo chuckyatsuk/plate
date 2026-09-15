@@ -46,13 +46,68 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mint the id and the key from the caller's account. Any account a caller
-	// tries to smuggle is structurally ignored: the key is built from acct, full
-	// stop. UploadRequest has no account field precisely so it cannot be
-	// expressed — and the presigned PUT is bound to THIS key, so a PUT to another
-	// prefix is rejected by the signature (proven in storage_presign_test).
-	assetID := id.New()
-	key := id.VaultKey(acct, assetID) // {account}/{asset-id}
+	// AUTHORED RENDITION (Tier 2 V4.1): when the request binds a rendition, this
+	// upload is a FILE for an existing asset's intent, not a new asset's original.
+	// It PUTs to a STAGING key (vault side of the wall, never served); finalize
+	// enqueues a remux that copies it to the delivery key. Validate the binding
+	// fully here so an invalid one never mints a ticket.
+	var (
+		assetID string
+		key     string
+		rAsset  string
+		rIntent string
+	)
+	if req.Rendition != nil {
+		rAsset = req.Rendition.AssetId
+		rIntent = string(req.Rendition.Intent)
+
+		// The target asset must belong to the caller (leak-safe: an unowned or
+		// unknown asset is a 404, same shape as every cross-account read).
+		owned, oerr := s.store.AssetOwnedBy(r.Context(), acct, rAsset)
+		if oerr != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "could not verify asset ownership")
+			return
+		}
+		if !owned {
+			denyNotFound(w)
+			return
+		}
+
+		// Only A/V intents are authored — poster/loop/detail. An image intent is
+		// resolved synchronously by imgproxy and has no rendition file to author;
+		// `original` is not a rendition. Fail-closed allowlist, not a negation.
+		if rIntent != string(plate.Poster) && rIntent != string(plate.Loop) && rIntent != string(plate.Detail) {
+			writeError(w, http.StatusBadRequest, "bad_request", "authored rendition intent must be poster, loop, or detail")
+			return
+		}
+
+		// Reject authoring over an existing READY rendition (409). Replacing a
+		// ready rendition is an explicit delete-then-author. A pending/failed/
+		// not_derived row does NOT block — authoring a declined or failed intent
+		// is the on-demand request the design allows.
+		if status, exists, serr := s.store.RenditionStatusFor(r.Context(), rAsset, plate.Intent(rIntent)); serr != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "could not check rendition state")
+			return
+		} else if exists && status == plate.RenditionStatus("ready") {
+			writeError(w, http.StatusConflict, "rendition_exists", "a ready rendition for this intent already exists; delete it before authoring a replacement")
+			return
+		}
+
+		// The upload id is its own id, but the STAGING key is keyed on the TARGET
+		// asset + intent (per (asset, intent): a re-authored file overwrites its
+		// own staging object rather than accumulating).
+		assetID = id.New()
+		key = id.StagingKey(acct, rAsset, rIntent)
+	} else {
+		// Ordinary original: mint the id and the vault key from the caller's
+		// account. Any account a caller tries to smuggle is structurally ignored:
+		// the key is built from acct, full stop. UploadRequest has no account field
+		// precisely so it cannot be expressed — and the presigned PUT is bound to
+		// THIS key, so a PUT to another prefix is rejected by the signature (proven
+		// in storage_presign_test).
+		assetID = id.New()
+		key = id.VaultKey(acct, assetID) // {account}/{asset-id}
+	}
 
 	put, err := s.storage.PresignPut(r.Context(), storage.PutConstraints{
 		Key:           key,
@@ -80,6 +135,9 @@ func (s *Service) handleCreateUpload(w http.ResponseWriter, r *http.Request) {
 		Filename:    filename,
 		// Declared here, acted on at finalize — the flag rides on the row.
 		SkipDerivations: req.SkipDerivations != nil && *req.SkipDerivations,
+		// Authored-rendition binding (empty for an ordinary original).
+		RenditionAsset:  rAsset,
+		RenditionIntent: rIntent,
 	}); err != nil {
 		if errors.Is(err, store.ErrUnknownAccount) {
 			// The token's account has no row yet — provision it with
@@ -202,6 +260,27 @@ func (s *Service) handleFinalizeUpload(w http.ResponseWriter, r *http.Request) {
 	if !info.Exists {
 		// The PUT never completed — nothing to finalize. 409 per the contract.
 		writeError(w, http.StatusConflict, "not_uploaded", "no uploaded object found for this upload")
+		return
+	}
+
+	// AUTHORED RENDITION (Tier 2 V4.1): the staged file landed. Do NOT create an
+	// asset — the target asset already exists. Enqueue a remux job that stream-
+	// copies the staged file into the intent's delivery object. The authored
+	// ceilings are enforced IN the job (on the probed staged file), before the
+	// remux writes anything, so a bad file becomes a named terminal refusal rather
+	// than a delivered rendition. The rendition is `pending` until the short job
+	// runs; the caller polls the asset (plateAV.pending on the Files side).
+	if up.RenditionAsset != "" && up.RenditionIntent != "" {
+		job, jerr := s.store.EnqueueRemuxJob(
+			r.Context(), acct, up.RenditionAsset, plate.Intent(up.RenditionIntent), up.Key,
+		)
+		if jerr != nil {
+			writeError(w, http.StatusInternalServerError, "internal", "authored file stored but remux enqueue failed")
+			return
+		}
+		// 202 + the job: an authored rendition is async (the remux), the same shape
+		// as a requested derivation.
+		writeJSON(w, http.StatusAccepted, job)
 		return
 	}
 
