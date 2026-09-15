@@ -92,7 +92,19 @@ func (p *Postgres) ClaimNextJob(ctx context.Context, leaseTTL time.Duration) (Cl
 			SELECT id FROM jobs
 			WHERE status = 'queued'
 			   OR (status = 'running' AND heartbeat_at < $1)
-			ORDER BY created
+			-- SHORT work first, then oldest (Tier 2 V4.1). A remux (stream-copy of
+			-- an authored file) and a poster are seconds; a loop is short; a derived
+			-- detail is minutes. Claiming detail ahead of them is the poster problem
+			-- (V3): the quick job waits behind a long transcode and the still/remux
+			-- lands late. Tiers: remux + poster = 0, loop = 1, derived detail = 2.
+			-- Keyed on MODE (not intent) for remux, because an authored detail's
+			-- remux job carries intent 'detail' -- only the mode column tells them apart.
+			ORDER BY (CASE
+			              WHEN mode = 'remux'     THEN 0
+			              WHEN intent = 'poster'  THEN 0
+			              WHEN intent = 'loop'    THEN 1
+			              ELSE 2
+			          END), created
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
