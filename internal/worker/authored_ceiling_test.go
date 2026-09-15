@@ -33,6 +33,9 @@ func TestAuthoredCeilingBreach_NamesTheLimit(t *testing.T) {
 	}{
 		{"detail ok", plate.Detail, okDetail, ""},
 		{"loop ok", plate.Loop, okLoop, ""},
+		// A portrait studio loop (Favourite: 640×1138) — long edge 1138, over the old
+		// 640 cap, under the 1080 one. Must PASS: the viewer ceiling is bitrate+duration.
+		{"loop portrait 640x1138 passes", plate.Loop, mut(okLoop, func(r *probe.Result) { r.Width, r.Height = 640, 1138; r.DurationS = 8; r.BitrateBPS = 260_000 }), ""},
 
 		// detail breaches
 		{"detail non-h264 video", plate.Detail, mut(okDetail, func(r *probe.Result) { r.Codec = "vp9" }), plate.ReasonCodeAuthoredCodecUnsupported},
@@ -42,7 +45,7 @@ func TestAuthoredCeilingBreach_NamesTheLimit(t *testing.T) {
 
 		// loop breaches
 		{"loop non-h264", plate.Loop, mut(okLoop, func(r *probe.Result) { r.Codec = "vp9" }), plate.ReasonCodeAuthoredCodecUnsupported},
-		{"loop over 640px", plate.Loop, mut(okLoop, func(r *probe.Result) { r.Width, r.Height = 1280, 720 }), plate.ReasonCodeAuthoredResolutionExceeded},
+		{"loop over 1920px long edge", plate.Loop, mut(okLoop, func(r *probe.Result) { r.Width, r.Height = 3840, 2160 }), plate.ReasonCodeAuthoredResolutionExceeded},
 		{"loop over 30s", plate.Loop, mut(okLoop, func(r *probe.Result) { r.DurationS = 45 }), plate.ReasonCodeAuthoredLoopTooLong},
 		{"loop over 2Mbps", plate.Loop, mut(okLoop, func(r *probe.Result) { r.BitrateBPS = 5_000_000 }), plate.ReasonCodeAuthoredBitrateExceeded},
 

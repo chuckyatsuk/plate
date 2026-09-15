@@ -275,7 +275,15 @@ func (w *Worker) process(ctx context.Context, job store.ClaimedJob) error {
 const (
 	authoredDetailMaxWidth  = 1920
 	authoredDetailMaxHeight = 1080
-	authoredLoopMaxEdge     = 640
+	// An authored loop's resolution ceiling is a VIEWER ceiling (bytes+pixels a phone
+	// decodes), not a compute one — the file is remuxed, never transcoded. Bitrate (2
+	// Mbps) and duration (30s) do the real bounding; the long edge only guards against
+	// an absurd frame. It matches detail's largest side (1920) rather than detail's
+	// "1080 side", because a loop can be PORTRAIT — a 9:16 studio loop's long edge is
+	// its height (e.g. 640×1138), and a portrait tile up to 1080×1920 is fine on a
+	// phone. (The DERIVED loop is still produced at 640 — that's what Plate makes for a
+	// grid tile; this cap governs only what an AUTHORED file is allowed to be.)
+	authoredLoopMaxEdge     = 1920
 	authoredLoopMaxDuration = 30.0              // seconds — viewer cap, not compute
 	authoredDetailMaxBPS    = 8 * 1_000_000     // 8 Mbps
 	authoredLoopMaxBPS      = 2 * 1_000_000     // 2 Mbps
@@ -377,7 +385,7 @@ func authoredCeilingBreach(intent plate.Intent, pr probe.Result) (plate.ReasonCo
 			return plate.ReasonCodeAuthoredBitrateExceeded, false
 		}
 	case plate.Loop:
-		// H.264, SILENT, ≤640px long edge, ≤30s, ≤2 Mbps.
+		// H.264, SILENT, ≤1920px long edge (portrait-safe), ≤30s, ≤2 Mbps.
 		if !isH264(pr.Codec) {
 			return plate.ReasonCodeAuthoredCodecUnsupported, false
 		}
