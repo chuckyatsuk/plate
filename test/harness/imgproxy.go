@@ -88,7 +88,7 @@ func StartImgproxy(t *testing.T, fixtureRoot string) *Imgproxy {
 			// 400" (spec §7). 100MP headroom covers Uri's 96MP shots.
 			"IMGPROXY_MAX_SRC_RESOLUTION": "100",
 			// Result-edge belt (from mediaspec, single source) so the harness proves
-			// the same edge ceiling production runs — matches deploy/fly.imgproxy.toml.
+			// the same edge ceiling production runs — matches deploy/fly.imgproxy.plate.toml.
 			"IMGPROXY_MAX_RESULT_DIMENSION": fmt.Sprintf("%d", mediaspec.MaxResultDimension),
 		},
 		Files: []testcontainers.ContainerFile{},
