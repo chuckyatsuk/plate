@@ -4,9 +4,10 @@ package mediaspec_test
 // hard-codes IMGPROXY_PRESETS as a literal string (a prebuilt-image env can't call
 // `plate imgproxy-presets`), so it can silently drift from mediaspec.PresetDefs()
 // — the single source the image-clamp tests verify against. This test reads the
-// committed deploy/fly.imgproxy.toml and asserts its IMGPROXY_PRESETS line equals
-// PresetDefs(), so a preset change that isn't mirrored into the deploy fails CI
-// instead of shipping an imgproxy that transforms to the wrong dimensions.
+// committed deploy/fly.imgproxy.plate.toml (the live prod manifest) and asserts its
+// IMGPROXY_PRESETS line equals PresetDefs(), so a preset change that isn't mirrored
+// into the deploy fails CI instead of shipping an imgproxy that transforms to the
+// wrong dimensions.
 
 import (
 	"os"
@@ -19,7 +20,7 @@ import (
 )
 
 func TestImgproxyDeployPresetsMatchMediaspec(t *testing.T) {
-	const tomlPath = "../../deploy/fly.imgproxy.toml"
+	const tomlPath = "../../deploy/fly.imgproxy.plate.toml"
 	raw, err := os.ReadFile(tomlPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", tomlPath, err)
