@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -129,7 +130,22 @@ func LoadEnv() (EnvConfig, error) {
 	if err != nil {
 		return EnvConfig{}, err
 	}
+	// Key → account bindings (PLATE_JWT_KEY_ACCOUNTS) and the strict switch
+	// (PLATE_JWT_REQUIRE_KEY_BINDING). Both are opt-in: unset, every trusted key
+	// stays unbound and verifies exactly as before.
+	bindings, err := parseKeyBindings(os.Getenv("PLATE_JWT_KEY_ACCOUNTS"))
+	if err != nil {
+		return EnvConfig{}, err
+	}
+	requireBinding, err := parseBoolEnv("PLATE_JWT_REQUIRE_KEY_BINDING")
+	if err != nil {
+		return EnvConfig{}, err
+	}
 	if legacyStr == "" && keyset == nil {
+		if len(bindings) > 0 {
+			return EnvConfig{}, errors.New(
+				"service: PLATE_JWT_KEY_ACCOUNTS binds keys but no key is trusted (PLATE_JWT_PUBLIC_KEY / PLATE_JWT_PUBLIC_KEYS are empty) — every binding names an unknown key")
+		}
 		cfg.Verifier = auth.DenyAllVerifier()
 		return cfg, nil
 	}
@@ -150,8 +166,86 @@ func LoadEnv() (EnvConfig, error) {
 			return EnvConfig{}, fmt.Errorf("service: PLATE_JWT_PUBLIC_KEY: %w", err)
 		}
 	}
-	cfg.Verifier = auth.NewKeysetVerifier(legacy, keyset, os.Getenv("PLATE_JWT_ISSUER"), os.Getenv("PLATE_JWT_AUDIENCE"))
+	cfg.Verifier, err = auth.NewBoundKeysetVerifier(legacy, keyset, bindings, os.Getenv("PLATE_JWT_ISSUER"), os.Getenv("PLATE_JWT_AUDIENCE"))
+	if err != nil {
+		return EnvConfig{}, fmt.Errorf("service: PLATE_JWT_KEY_ACCOUNTS: %w", err)
+	}
+	if unbound := cfg.Verifier.UnboundKeys(); requireBinding && len(unbound) > 0 {
+		return EnvConfig{}, fmt.Errorf(
+			"service: PLATE_JWT_REQUIRE_KEY_BINDING=true but these trusted keys have no account binding in PLATE_JWT_KEY_ACCOUNTS: %s — an unbound key can sign for ANY account on this deployment",
+			strings.Join(unbound, ", "))
+	}
 	return cfg, nil
+}
+
+// parseKeyBindings parses PLATE_JWT_KEY_ACCOUNTS: comma-separated `name=pattern`
+// pairs, where name is a kid from PLATE_JWT_PUBLIC_KEYS or auth.LegacyKeyName
+// ("@legacy") for the legacy no-kid key, and pattern is an exact account id
+// ("uri=uriaran") or a namespace prefix ending in '*' ("registry=reg_*").
+// Returns nil for an empty/unset value. A malformed pair, an unknown-shaped
+// name, a bad pattern (including a bare "*") or a duplicate name refuses boot —
+// a binding the operator believes is in force must never be silently dropped.
+// Whether each name is a TRUSTED key is checked by auth.NewBoundKeysetVerifier.
+func parseKeyBindings(s string) (map[string]auth.AccountPattern, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	out := make(map[string]auth.AccountPattern)
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue // tolerate a trailing comma
+		}
+		name, pat, found := strings.Cut(entry, "=")
+		name, pat = strings.TrimSpace(name), strings.TrimSpace(pat)
+		if !found || name == "" || pat == "" {
+			return nil, fmt.Errorf("service: PLATE_JWT_KEY_ACCOUNTS entry %q is not kid=account-pattern", entry)
+		}
+		if name != auth.LegacyKeyName && !validKid(name) {
+			return nil, fmt.Errorf("service: PLATE_JWT_KEY_ACCOUNTS names %q, which is neither a kid ([A-Za-z0-9_-]{1,64}) nor %s", name, auth.LegacyKeyName)
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("service: PLATE_JWT_KEY_ACCOUNTS binds %q twice — one key has one binding", name)
+		}
+		p, err := auth.ParseAccountPattern(pat)
+		if err != nil {
+			return nil, fmt.Errorf("service: PLATE_JWT_KEY_ACCOUNTS %q: %w", name, err)
+		}
+		out[name] = p
+	}
+	if len(out) == 0 {
+		return nil, errors.New("service: PLATE_JWT_KEY_ACCOUNTS is set but contains no kid=pattern entries")
+	}
+	return out, nil
+}
+
+// parseBoolEnv reads a strict boolean flag: unset or empty is false; anything
+// strconv.ParseBool rejects is a boot error, so a typo ("ture") cannot silently
+// leave a safety switch off.
+func parseBoolEnv(key string) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("service: %s=%q is not a boolean (use true or false)", key, v)
+	}
+	return b, nil
+}
+
+// LogKeyBindings reports the key → account binding state at boot: one WARN per
+// trusted key with NO binding (it can sign for any account on this deployment)
+// and one INFO per bound key. Nothing secret is logged — names and patterns only.
+func LogKeyBindings(log *slog.Logger, v *auth.Verifier) {
+	for _, name := range v.UnboundKeys() {
+		log.Warn("trusted token key has no account binding (PLATE_JWT_KEY_ACCOUNTS) — it can sign for ANY account on this deployment", "key", name)
+	}
+	for _, name := range v.BoundKeys() {
+		p, _ := v.Binding(name)
+		log.Info("trusted token key is account-bound", "key", name, "accounts", p.String())
+	}
 }
 
 // parseKeyset parses PLATE_JWT_PUBLIC_KEYS: comma-separated `kid=base64` pairs,

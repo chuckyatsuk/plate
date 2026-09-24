@@ -96,6 +96,13 @@ type Service struct {
 // hour-long un-revocable window.
 const GrantedImageMaxTTL = 120 * time.Second
 
+// DefaultGrantedURLTTL is the granted-URL window when PLATE_GRANTED_URL_TTL is
+// unset. It must sit UNDER GrantedImageMaxTTL: the cap used to be checked only
+// against an explicit env value, so the old 5-minute default silently gave an
+// unconfigured deployment a revoked image that kept loading for 5 minutes. 90s
+// matches what production sets explicitly.
+const DefaultGrantedURLTTL = 90 * time.Second
+
 // New builds a Service from Config.
 func New(cfg Config) *Service {
 	ttl := cfg.UploadTTL
@@ -104,7 +111,13 @@ func New(cfg Config) *Service {
 	}
 	gurlTTL := cfg.GrantURLTTL
 	if gurlTTL <= 0 {
-		gurlTTL = 5 * time.Minute // short: a forwarded link expires soon (spec Q3.B)
+		gurlTTL = DefaultGrantedURLTTL // short: a forwarded link expires soon (spec Q3.B)
+	}
+	// The cap holds on the EFFECTIVE value, however it was configured. LoadEnv
+	// already refuses to boot on an env value past the cap; this keeps any other
+	// constructor path (tests, future callers) from minting a longer window.
+	if gurlTTL > GrantedImageMaxTTL {
+		gurlTTL = GrantedImageMaxTTL
 	}
 	return &Service{
 		store:          cfg.Store,

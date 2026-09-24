@@ -43,6 +43,7 @@ func (s *Service) Router() http.Handler {
 	api.HandleFunc("POST /v1/exports", s.handleCreateExport)
 	api.HandleFunc("GET /v1/exports/{exportId}", s.handleGetExport)
 	api.HandleFunc("DELETE /v1/exports/{exportId}", s.handleRevokeExport)
+	api.HandleFunc("PUT /v1/account", s.handleProvisionAccount)
 
 	mux.Handle("/v1/", s.verf.Middleware(api))
 	return mux

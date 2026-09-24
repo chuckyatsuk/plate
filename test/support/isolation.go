@@ -40,12 +40,13 @@ const (
 	ScopeRenditionsGenerate Scope = "renditions:generate"
 	ScopeGrantsManage       Scope = "grants:manage"
 	ScopeAssetsExport       Scope = "assets:export"
+	ScopeAccountsProvision  Scope = "accounts:provision"
 )
 
 // AllScopes is the full set — a maximally-privileged token. A denial that holds
 // for THIS actor is a true account-isolation denial, not an accident of scope.
 func AllScopes() []Scope {
-	return []Scope{ScopeAssetsRead, ScopeAssetsWrite, ScopeRenditionsGenerate, ScopeGrantsManage, ScopeAssetsExport}
+	return []Scope{ScopeAssetsRead, ScopeAssetsWrite, ScopeRenditionsGenerate, ScopeGrantsManage, ScopeAssetsExport, ScopeAccountsProvision}
 }
 
 // Actor identifies a caller by the account claim inside its (real, in
@@ -132,6 +133,12 @@ const (
 	EpCreateExport       EndpointID = "createExport"
 	EpGetExport          EndpointID = "getExport"
 	EpRevokeExport       EndpointID = "revokeExport"
+	// EpProvisionAccount has no target and no result set: it creates the
+	// CALLER's own account (the token claim). Its isolation property — it can
+	// only ever create the claim's account, and only inside the namespace its
+	// key is bound to — is proven by test/account_self_provisioning_test.go and
+	// test/key_binding_isolation_test.go, not by the cross-account table.
+	EpProvisionAccount EndpointID = "provisionAccount"
 )
 
 // AccountScopedService is what the real service implements to be conformance-

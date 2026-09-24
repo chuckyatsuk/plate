@@ -69,6 +69,10 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
 #                                BOTH files-20260914 (demo self-mint) AND uri-YYYYMMDD
 #                                (the client). EMPTY until B2 → API denies all tokens
 #                                (expected, see the readyz note above).
+#   PLATE_JWT_KEY_ACCOUNTS       OPTIONAL key → account binding `kid=<account>|<prefix>*,…`
+#                                (`@legacy` = the no-kid key). Unset = every key may claim
+#                                any account (unchanged).
+#   PLATE_JWT_REQUIRE_KEY_BINDING OPTIONAL `true` = refuse boot while any trusted key is unbound.
 # Delivery (granted/signed/original — set so the byte edge is enforceable):
 #   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download — a REAL prod secret (A2),
 #                                NOT the demo throwaway

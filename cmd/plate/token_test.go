@@ -71,7 +71,7 @@ func TestSplitCSV(t *testing.T) {
 // Every scope the command accepts must be one the token model knows; a typo must
 // not silently mint a credential that grants nothing.
 func TestKnownScopes(t *testing.T) {
-	for _, s := range []string{"assets:read", "assets:write", "renditions:generate", "grants:manage"} {
+	for _, s := range []string{"assets:read", "assets:write", "renditions:generate", "grants:manage", "assets:export", "accounts:provision"} {
 		if !knownScopes[s] {
 			t.Errorf("known scope %q missing from knownScopes", s)
 		}
