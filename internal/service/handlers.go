@@ -415,6 +415,12 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 // image URL is signed — public (exp nil: stable, cacheable) and granted (exp set:
 // imgproxy enforces the window). Returns ok=false when imgproxy signing or the
 // source bucket is not configured (fail closed — no unsigned image URL ships).
+//
+// Public and granted URLs go to DIFFERENT imgproxy hosts (see
+// imgproxySigner.signedImageURL): public → ImageCDNBase (presets-only, the host
+// consumers persist), granted → GrantedImageBase (options mode, pr+exp only).
+// With no GrantedImageBase a granted image refuses (ok=false → 503
+// unconfigured) rather than emitting a URL the presets-only host rejects.
 func (s *Service) signedImageURL(intent, vaultKey string, exp *time.Time) (string, bool) {
 	if s.imgsigner == nil {
 		return "", false
@@ -423,7 +429,14 @@ func (s *Service) signedImageURL(intent, vaultKey string, exp *time.Time) (strin
 	if src == "" {
 		return "", false
 	}
-	return s.imgsigner.signedImageURL(s.urls.ImageCDNBase, intent, src, exp), true
+	base := s.urls.ImageCDNBase
+	if exp != nil {
+		base = s.urls.GrantedImageBase
+		if base == "" {
+			return "", false
+		}
+	}
+	return s.imgsigner.signedImageURL(base, intent, src, exp), true
 }
 
 // assetIDFromRenditionKey extracts the asset id from a rendition key. Since the

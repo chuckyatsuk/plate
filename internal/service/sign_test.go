@@ -103,7 +103,7 @@ func TestImgproxySigner_KnownAnswerFormat(t *testing.T) {
 	if s == nil {
 		t.Fatal("valid hex must yield a signer")
 	}
-	path := "/lightbox/exp:1700000000/plain/acct/asset@jpg"
+	path := "/pr:lightbox/exp:1700000000/plain/acct/asset@jpg"
 	got := s.signPath(path)
 	// Recompute independently.
 	want := recomputeImgproxy(t, []byte("key"), []byte("salt"), path)
@@ -121,9 +121,10 @@ func TestImgproxySigner_ExpInSignedPath(t *testing.T) {
 	src := "s3://plate-demo/vault/acct/asset"
 	url := s.signedImageURL("https://cdn.example", "lightbox", src, &exp)
 	// The exp: option must be INSIDE the signed path (so imgproxy enforces it),
-	// between the preset and the plain source; source is the private S3 URL.
-	if !strings.Contains(url, "/lightbox/exp:1700000000/plain/"+src) {
-		t.Fatalf("exp must sit in the signed path between preset and s3 source; got %q", url)
+	// after the EXPLICIT pr: preset option (the granted imgproxy runs options
+	// mode, pr+exp only) and before the plain source (the private S3 URL).
+	if !strings.Contains(url, "/pr:lightbox/exp:1700000000/plain/"+src) {
+		t.Fatalf("granted URL must be /{sig}/pr:{preset}/exp:{unix}/plain/{src}; got %q", url)
 	}
 	if !strings.HasPrefix(url, "https://cdn.example/") {
 		t.Fatalf("must be built on the base; got %q", url)

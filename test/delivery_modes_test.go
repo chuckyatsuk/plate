@@ -130,8 +130,13 @@ func TestE2E_GrantedImage_IsImgproxySigned(t *testing.T) {
 	if strings.Contains(res.Delivery.URL, "/unsafe/") {
 		t.Fatalf("granted image must be imgproxy-SIGNED, not /unsafe/; got %q", res.Delivery.URL)
 	}
-	if !strings.Contains(res.Delivery.URL, "/exp:") || !strings.Contains(res.Delivery.URL, "/plain/") {
-		t.Fatalf("granted image must carry exp+plain in the signed path; got %q", res.Delivery.URL)
+	if !strings.Contains(res.Delivery.URL, "/pr:") || !strings.Contains(res.Delivery.URL, "/exp:") || !strings.Contains(res.Delivery.URL, "/plain/") {
+		t.Fatalf("granted image must carry pr+exp+plain in the signed path; got %q", res.Delivery.URL)
+	}
+	// Granted images are served by the SEPARATE options-mode imgproxy — the
+	// presets-only public host cannot parse exp (2026-09-24 bug).
+	if !strings.HasPrefix(res.Delivery.URL, "https://granted-img.example/") {
+		t.Fatalf("granted image must be on the granted imgproxy host; got %q", res.Delivery.URL)
 	}
 }
 
