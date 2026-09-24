@@ -1,0 +1,90 @@
+# imgproxy — PRODUCTION, GRANTED images only. A SECOND imgproxy app, beside the
+# public one (deploy/fly.imgproxy.plate.toml, esf-plate-imgproxy), that serves the
+# short-lived GRANTED image URLs Plate issues:
+#
+#     {IMGPROXY_GRANTED_BASE_URL}/{sig}/pr:{preset}/exp:{unix}/plain/{s3-vault-src}
+#
+# WHY A SEPARATE APP (2026-09-24): the public app runs IMGPROXY_ONLY_PRESETS=true.
+# In that mode imgproxy reads exactly ONE path segment as the preset list and
+# everything after it as the source URL, so a granted URL's `exp:{unix}` segment is
+# read as the start of the source and rejected 404 "Invalid URL". Turning
+# presets-only off on the PUBLIC app is not an option: in options mode a bare
+# `/{preset}/` segment (no ':') is read as the start of the source URL, so every
+# public URL already persisted by consumers (Uri's site stores them) would 404.
+# No single URL shape is valid in both modes, so the modes live on two hosts.
+#
+# LOCKDOWN (the ONLY_PRESETS equivalent for this app): options mode, but
+# IMGPROXY_ALLOWED_PROCESSING_OPTIONS = "pr,exp" — a URL may name a preset and an
+# expiry and NOTHING else (width/quality/crop are refused "Forbidden processing
+# option"). Options applied from INSIDE a preset are not subject to the list
+# (imgproxy applies presets with allowAll), so the preset definitions still work.
+# The names are matched exactly as written in the URL, so they must stay the
+# short forms Plate emits (`pr`, `exp`) — TestImgproxyURLsValidUnderDeployConfigs
+# pins this against internal/service/sign.go.
+#
+# Everything else — presets, S3 origin, size belts — is IDENTICAL to the public
+# app (the preset-drift test checks both files against mediaspec).
+#
+# ⚠️ Uses the prebuilt darthsim/imgproxy image, so there is NO source [build].
+# PINNED (not :latest) to the version whose URL parser this app's config was
+# checked against (imgproxy v4.0.15, options/parser/processing_options.go).
+# Deploy: `fly deploy -a esf-plate-imgproxy-granted -c deploy/fly.imgproxy-granted.plate.toml`
+#
+# HOSTNAME / CACHE: the API's IMGPROXY_GRANTED_BASE_URL points here. It MUST NOT be
+# the public host (LoadEnv refuses to boot if the two are equal). Whatever fronts
+# this app must NOT override origin Cache-Control with a long edge TTL: imgproxy
+# caps max-age at the time remaining before `exp`, and a CDN rule that caches for a
+# year would keep serving a granted image after it expired. The plain
+# esf-plate-imgproxy-granted.fly.dev hostname satisfies this with no CDN at all.
+
+app = "esf-plate-imgproxy-granted"
+primary_region = "iad"  # same region as the API and the public imgproxy
+
+[build]
+  image = "darthsim/imgproxy:v4.0.15"
+
+[env]
+  # Options mode (NOT presets-only) so `exp:` can be parsed — locked to pr+exp.
+  IMGPROXY_ONLY_PRESETS = "false"
+  IMGPROXY_ALLOWED_PROCESSING_OPTIONS = "pr,exp"
+
+  # Presets: MUST equal `plate imgproxy-presets` (mediaspec.PresetDefs), exactly as
+  # on the public app. Regenerate with:  go run ./cmd/plate imgproxy-presets
+  IMGPROXY_PRESETS = "lightbox=resize:fit:2048:2048:0/enlarge:0,lightbox_mobile=resize:fit:1400:1400:0/enlarge:0,thumbnail=resize:fit:400:400:0/enlarge:0,grid=resize:fit:800:800:0/enlarge:0,zoom_1=resize:fit:3072:3072:0/enlarge:0/quality:100,zoom_2=resize:fit:4096:4096:0/enlarge:0/quality:100,zoom_3_nearsquare=resize:fit:4898:4898:0/enlarge:0/quality:100,zoom_3_standard=resize:fit:5477:5477:0/enlarge:0/quality:100,zoom_3_wide=resize:fit:6197:6197:0/enlarge:0/quality:100"
+
+  # Origin: PRIVATE S3 (R2), same as the public app — the vault is never publicly
+  # reachable; there is deliberately NO IMGPROXY_BASE_URL.
+  IMGPROXY_USE_S3 = "true"
+  IMGPROXY_S3_ENDPOINT = "https://87c7daae690b39a2efedf6ef10773606.r2.cloudflarestorage.com"
+  IMGPROXY_S3_REGION = "auto"
+
+  # Size belts — identical to the public app (and to mediaspec; drift-tested).
+  IMGPROXY_MAX_SRC_RESOLUTION = "100"
+  IMGPROXY_MAX_RESULT_DIMENSION = "6197"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# ── Secrets (fly secrets set -a esf-plate-imgproxy-granted …) ────────────────────
+# Same values as esf-plate-imgproxy — imgproxy MUST be keyed or it serves unsigned
+# (/unsafe/) URLs, and the key/salt MUST match the API's or Plate's signatures fail:
+#   IMGPROXY_KEY   (hex)  — same value as on esf-plate-api
+#   IMGPROXY_SALT  (hex)  — same value as on esf-plate-api
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY — R2 READ on vault/* of `plate`
+# Sharing the key is safe: a public URL sent here and a granted URL sent to the
+# public host are both rejected by the parser (no shape is valid in both modes).

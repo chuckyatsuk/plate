@@ -55,6 +55,10 @@ func LoadEnv() (EnvConfig, error) {
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		URLs: URLBuilder{
 			ImageCDNBase: os.Getenv("IMGPROXY_BASE_URL"),
+			// Granted (expiring) images are served by a SEPARATE imgproxy in
+			// options mode (pr+exp only); the presets-only public host cannot
+			// parse exp. Unset ⇒ granted images refuse (503), fail closed.
+			GrantedImageBase: os.Getenv("IMGPROXY_GRANTED_BASE_URL"),
 			// imgproxy reads originals as a PRIVATE S3 source from this bucket
 			// (s3://{bucket}/vault/...), so the vault original is never publicly
 			// reachable. Same bucket as storage; imgproxy holds its own R2 creds.
@@ -85,6 +89,14 @@ func LoadEnv() (EnvConfig, error) {
 		return EnvConfig{}, fmt.Errorf(
 			"service: PLATE_GRANTED_URL_TTL (%s) exceeds the %s cap on granted-image expiry — a granted image is enforced by imgproxy, which cannot check revocation, so a longer window is silently un-revocable (spec Q3.B)",
 			cfg.GrantURLTTL, GrantedImageMaxTTL)
+	}
+	// Fail fast if the granted-image host is the PUBLIC presets-only host: that
+	// imgproxy cannot parse the granted URL's exp option and answers every
+	// granted image 404 "Invalid URL" (the 2026-09-24 bug). Unset is fine (granted
+	// images then refuse 503); the SAME host is always a misconfiguration.
+	if g := strings.TrimRight(cfg.URLs.GrantedImageBase, "/"); g != "" && g == strings.TrimRight(cfg.URLs.ImageCDNBase, "/") {
+		return EnvConfig{}, errors.New(
+			"service: IMGPROXY_GRANTED_BASE_URL must not equal IMGPROXY_BASE_URL — the public imgproxy runs presets-only and rejects granted (exp) URLs; point it at the granted imgproxy (deploy/fly.imgproxy-granted.plate.toml) or leave it unset")
 	}
 	if cfg.DatabaseURL == "" {
 		return EnvConfig{}, errors.New("service: DATABASE_URL is required")

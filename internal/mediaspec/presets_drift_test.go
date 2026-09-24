@@ -19,8 +19,20 @@ import (
 	"github.com/chuckyatsuk/plate/internal/mediaspec"
 )
 
+// Both live imgproxy apps are checked: the public presets-only app and the
+// granted (pr+exp options-mode) app must transform to the SAME dimensions, or a
+// granted image would differ from its public counterpart.
 func TestImgproxyDeployPresetsMatchMediaspec(t *testing.T) {
-	const tomlPath = "../../deploy/fly.imgproxy.plate.toml"
+	for _, tomlPath := range []string{
+		"../../deploy/fly.imgproxy.plate.toml",
+		"../../deploy/fly.imgproxy-granted.plate.toml",
+	} {
+		t.Run(tomlPath, func(t *testing.T) { checkImgproxyDeployPresets(t, tomlPath) })
+	}
+}
+
+func checkImgproxyDeployPresets(t *testing.T, tomlPath string) {
+	t.Helper()
 	raw, err := os.ReadFile(tomlPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", tomlPath, err)

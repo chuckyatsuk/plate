@@ -159,8 +159,16 @@ func RouteDelivery(kind plate.MediaKind, intent plate.Intent) (DeliveryHost, err
 // URLBuilder constructs delivery URL strings for each host. Injected so no live
 // imgproxy/R2 is contacted in Phase 1 and so the strings are unit-testable.
 type URLBuilder struct {
-	// ImageCDNBase is the imgproxy delivery base, e.g. https://cdn.example.
+	// ImageCDNBase is the imgproxy delivery base for PUBLIC images, e.g.
+	// https://cdn.example — the presets-only imgproxy (IMGPROXY_BASE_URL).
 	ImageCDNBase string
+	// GrantedImageBase is the imgproxy base for GRANTED (expiring) images — a
+	// separate imgproxy in options mode that accepts only pr+exp
+	// (IMGPROXY_GRANTED_BASE_URL, deploy/fly.imgproxy-granted.plate.toml). The
+	// presets-only public host cannot parse an exp option, so the two must be
+	// different hosts. Empty ⇒ granted images are refused (503), never emitted
+	// in a shape the public host rejects.
+	GrantedImageBase string
 	// ImageSourceBucket is the R2 bucket imgproxy reads originals from, as a
 	// PRIVATE S3 source: imgproxy fetches s3://{bucket}/{vaultKey} with its own R2
 	// credentials, never over the public delivery base — so the vault original is

@@ -71,6 +71,8 @@ func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 		Prober:   probe.New(""),
 		URLs: service.URLBuilder{
 			ImageCDNBase: "https://cdn.example",
+			// Granted (expiring) images go to the separate options-mode imgproxy.
+			GrantedImageBase: "https://granted-img.example",
 			// imgproxy reads originals as a private S3 source from this bucket;
 			// the image tests assert the URL SHAPE (they don't fetch through the
 			// harness imgproxy, which uses local:// — the clamp tests build their

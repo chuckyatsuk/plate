@@ -75,6 +75,12 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
 #   IMGPROXY_KEY IMGPROXY_SALT   hex — REAL prod values (A2); MUST match esf-plate-imgproxy
 #   IMGPROXY_BASE_URL = https://plate-img.everysinglefile.com   the CDN-fronted imgproxy
 #                                host (Cloudflare → esf-plate-imgproxy.fly.dev, cache rule).
+#                                PUBLIC image URLs only (presets-only imgproxy).
+#   IMGPROXY_GRANTED_BASE_URL = https://esf-plate-imgproxy-granted.fly.dev   GRANTED
+#                                (expiring) image URLs — the separate pr+exp imgproxy
+#                                (deploy/fly.imgproxy-granted.plate.toml). MUST differ
+#                                from IMGPROXY_BASE_URL (boot refuses). Unset ⇒ granted
+#                                images 503 `unconfigured` (fail closed).
 #   R2_PUBLIC_BASE   = https://plate-media.everysinglefile.com  the `plate` bucket's A/V
 #                                public custom domain (loops/details/original bytes).
 #   PLATE_DOWNLOAD_BASE = https://esf-plate-api.fly.dev             this API's own public base.

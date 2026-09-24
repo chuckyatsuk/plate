@@ -98,9 +98,9 @@ func (s *signer) mac(path, intent, grantID, expUnix string) string {
 // URL), this speaks imgproxy's wire format so IMGPROXY itself enforces expiry
 // and tamper at the byte edge — Plate never touches image bytes (Q5). The
 // signature is HMAC-SHA256 over salt_bytes+path_bytes, URL-safe base64 without
-// padding, placed as /{sig}/{path}; expiry is the `exp:{unix}` processing option
-// inside the signed path, which imgproxy 404s past. Both key and salt are
-// hex-encoded (IMGPROXY_KEY / IMGPROXY_SALT) and decoded to raw bytes here.
+// padding, placed as /{sig}/{path}; for granted URLs, expiry is the
+// `exp:{unix}` processing option inside the signed path, which imgproxy 404s
+// past. Both key and salt are hex-encoded (IMGPROXY_KEY / IMGPROXY_SALT) and decoded to raw bytes here.
 type imgproxySigner struct {
 	key  []byte
 	salt []byte
@@ -123,8 +123,8 @@ func newImgproxySigner(keyHex, saltHex string) *imgproxySigner {
 }
 
 // signPath takes the processing path (everything AFTER the signature segment,
-// with a leading slash — e.g. "/lightbox/exp:1700000000/plain/acct/asset@jpg")
-// and returns the full signed path "/{sig}/lightbox/exp:...". imgproxy verifies
+// with a leading slash — e.g. "/pr:lightbox/exp:1700000000/plain/acct/asset@jpg")
+// and returns the full signed path "/{sig}/pr:lightbox/exp:...". imgproxy verifies
 // exactly this.
 func (s *imgproxySigner) signPath(path string) string {
 	h := hmac.New(sha256.New, s.key)
@@ -135,17 +135,35 @@ func (s *imgproxySigner) signPath(path string) string {
 }
 
 // signedImageURL builds a full imgproxy-signed URL for an image intent. base is
-// the imgproxy host; preset is the intent name (ONLY_PRESETS: the preset IS the
-// first processing segment); source is the FULL source URL imgproxy fetches
-// (e.g. "s3://bucket/vault/acct/asset"). The signature is the leading segment, so
-// imgproxy — which checks ALL URLs once keyed — accepts it; the same signer
-// serves public (exp nil: stable, cacheable) and granted (exp set: imgproxy
-// enforces expiry) images. When set, the `exp:` option lives INSIDE the signed
-// path so it cannot be stripped.
+// the imgproxy host; preset is the intent name; source is the FULL source URL
+// imgproxy fetches (e.g. "s3://bucket/vault/acct/asset"). The signature is the
+// leading segment, so imgproxy — which checks ALL URLs once keyed — accepts it.
+//
+// Two URL shapes, for two DIFFERENTLY-configured imgproxy apps:
+//
+//   - PUBLIC (exp nil): /{sig}/{preset}/plain/{src}. Served by the presets-only
+//     imgproxy (IMGPROXY_ONLY_PRESETS=true, deploy/fly.imgproxy.plate.toml). In
+//     that mode imgproxy reads EXACTLY ONE path segment as a ':'-separated preset
+//     list and treats everything after it as the source URL, so the bare preset
+//     is the whole processing section. This shape is PERSISTED by consumers
+//     (Uri's site stores it on media docs) and CDN-cached for a year: it must
+//     never change byte-for-byte. Pinned by TestPublicImageURL_Golden.
+//
+//   - GRANTED (exp set): /{sig}/pr:{preset}/exp:{unix}/plain/{src}. Served by a
+//     SEPARATE imgproxy in normal (options) mode, locked to exactly these two
+//     options (IMGPROXY_ALLOWED_PROCESSING_OPTIONS=pr,exp,
+//     deploy/fly.imgproxy-granted.plate.toml). The presets-only app cannot serve
+//     it: there, "exp:{unix}" lands where the source URL must start and imgproxy
+//     answers 404 "Invalid URL" — which is why granted images live on their own
+//     host. `exp` sits INSIDE the signed path so it cannot be stripped; imgproxy
+//     404s the URL past it and caps Cache-Control max-age at the time remaining.
+//
+// Both shapes are checked against the committed imgproxy configs by
+// TestImgproxyURLsValidUnderDeployConfigs.
 func (s *imgproxySigner) signedImageURL(base, preset, source string, exp *time.Time) string {
 	var path string
 	if exp != nil {
-		path = fmt.Sprintf("/%s/exp:%d/plain/%s", preset, exp.Unix(), source)
+		path = fmt.Sprintf("/pr:%s/exp:%d/plain/%s", preset, exp.Unix(), source)
 	} else {
 		path = fmt.Sprintf("/%s/plain/%s", preset, source)
 	}

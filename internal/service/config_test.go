@@ -81,3 +81,36 @@ func TestLoadEnv_ThrowawayKeyBootsWithOptIn(t *testing.T) {
 		t.Fatalf("throwaway key WITH opt-in must boot; got %v", err)
 	}
 }
+
+// The granted-image host must never be the public presets-only host: that
+// imgproxy rejects every granted (exp) URL 404 "Invalid URL" (2026-09-24).
+func TestLoadEnv_GrantedImageBaseEqualToPublicFailsBoot(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("IMGPROXY_BASE_URL", "https://plate-img.example")
+	t.Setenv("IMGPROXY_GRANTED_BASE_URL", "https://plate-img.example/")
+	if _, err := LoadEnv(); err == nil {
+		t.Fatalf("IMGPROXY_GRANTED_BASE_URL equal to IMGPROXY_BASE_URL must fail boot")
+	}
+}
+
+func TestLoadEnv_GrantedImageBaseDistinctBoots(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("IMGPROXY_BASE_URL", "https://plate-img.example")
+	t.Setenv("IMGPROXY_GRANTED_BASE_URL", "https://plate-img-granted.example")
+	cfg, err := LoadEnv()
+	if err != nil {
+		t.Fatalf("distinct granted base must boot; got %v", err)
+	}
+	if cfg.URLs.GrantedImageBase != "https://plate-img-granted.example" {
+		t.Fatalf("GrantedImageBase not loaded; got %q", cfg.URLs.GrantedImageBase)
+	}
+}
+
+func TestLoadEnv_NoGrantedImageBaseBoots(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("IMGPROXY_BASE_URL", "https://plate-img.example")
+	t.Setenv("IMGPROXY_GRANTED_BASE_URL", "")
+	if _, err := LoadEnv(); err != nil {
+		t.Fatalf("unset granted base must boot (granted images then refuse 503); got %v", err)
+	}
+}
