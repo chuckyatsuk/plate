@@ -24,6 +24,16 @@ type MinIO struct {
 	Bucket   string
 }
 
+// MinIOImage is the S3 stand-in every e2e test runs against. It is a MIRROR of
+// quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z.hotfix.c630804a1 (linux/amd64),
+// republished unmodified (AGPL-3.0) to our own public GHCR package. MinIO closed
+// anonymous pulls on Docker Hub (2026-09-12) and then on quay.io (2026-09-25),
+// each time turning CI red for every PR; an image we host cannot be withdrawn
+// under us. PINNED to a release tag, never :latest. The image is amd64-only, so
+// callers pin the platform (native on CI, emulated on Apple-Silicon dev). Every
+// MinIO container in the suite uses this one constant, so they cannot drift.
+const MinIOImage = "ghcr.io/chuckyatsuk/minio:RELEASE.2025-04-22T22-12-26Z"
+
 // StartMinIO launches a MinIO container, creates the bucket, and returns a
 // Storage client pointed at it. It skips the test (via RequireDocker) when Docker
 // is unavailable, like the other container-backed helpers.
@@ -34,16 +44,7 @@ func StartMinIO(t *testing.T, bucket string) *MinIO {
 	ctx := context.Background()
 	const user, pass = "plate", "plate-secret"
 
-	// Pinned MinIO image, pulled from quay.io — NOT Docker Hub. Docker Hub now
-	// denies anonymous pulls of minio/minio (HTTP 401 "may require docker login",
-	// its anonymous rate-limit), which turned CI red for every PR (2026-09-12);
-	// quay.io serves the same image anonymously. PINNED to a RELEASE tag, not
-	// :latest — the unpinned tag is what made this a time-bomb (green until the
-	// registry policy shifted). The quay image is linux/amd64-only, so pin the
-	// platform explicitly: native on CI (ubuntu amd64), emulated on Apple-Silicon
-	// dev (without this, arm64 hosts fail with "no matching manifest for arm64").
-	// Keep it pinned + on quay + amd64; bump the tag deliberately.
-	c, err := tcminio.Run(ctx, "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z.hotfix.c630804a1",
+	c, err := tcminio.Run(ctx, MinIOImage,
 		tcminio.WithUsername(user),
 		tcminio.WithPassword(pass),
 		testcontainers.WithImagePlatform("linux/amd64"),
