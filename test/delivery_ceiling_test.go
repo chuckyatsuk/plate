@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuckyatsuk/plate/internal/auth"
 	"github.com/chuckyatsuk/plate/internal/probe"
 	"github.com/chuckyatsuk/plate/internal/service"
 	"github.com/chuckyatsuk/plate/internal/store"
@@ -51,6 +52,15 @@ type e2e struct {
 
 func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 	t.Helper()
+	return newE2EWithVerifier(t, detailCeilingS, nil)
+}
+
+// newE2EWithVerifier is newE2E with the service's token verifier supplied by the
+// test (e.g. one LoadEnv built from PLATE_JWT_* env, with key → account
+// bindings). nil keeps the default: a legacy-key verifier for e.priv. The
+// harness token (e.token, legacy-signed) is only valid under the default.
+func newE2EWithVerifier(t *testing.T, detailCeilingS float64, verfOverride *auth.Verifier) *e2e {
+	t.Helper()
 	harness.RequireDocker(t)
 	harness.RequireFFmpeg(t)
 	ctx := context.Background()
@@ -64,6 +74,9 @@ func newE2E(t *testing.T, detailCeilingS float64) *e2e {
 
 	pub, priv := ed25519Pair(t)
 	verf := newVerifier(t, pub)
+	if verfOverride != nil {
+		verf = verfOverride
+	}
 	svc := service.New(service.Config{
 		Store:    st,
 		Verifier: verf,

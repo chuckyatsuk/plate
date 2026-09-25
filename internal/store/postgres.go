@@ -167,19 +167,59 @@ func (p *Postgres) RevokeGrant(ctx context.Context, account, grantID string) (pl
 }
 
 func (p *Postgres) CreateGrant(ctx context.Context, account string, req plate.GrantRequest) (plate.Grant, error) {
-	// Verify EVERY asset in the set belongs to the caller. This is the write-side
-	// isolation check: a grant over another account's assets must be refused
-	// wholesale (spec Q3, "one grant per SET"), and we must not reveal which
-	// asset was foreign. Count owned assets among the requested ids; if the count
-	// differs, at least one is foreign or missing → refuse.
-	var owned int
-	err := p.pool.QueryRow(ctx, `
-		SELECT count(*) FROM assets
-		WHERE account = $1 AND id = ANY($2)`, account, req.Assets).Scan(&owned)
+	// Classify EVERY distinct requested id against the caller's account, in one
+	// snapshot. This is the write-side isolation check: a grant over another
+	// account's assets must be refused wholesale (spec Q3, "one grant per SET"),
+	// without revealing which id was foreign. Distinct ids, so a set that names
+	// the same asset twice is not mistaken for one naming a foreign asset.
+	//
+	//   live    — an asset row owned by the caller, not deleted;
+	//   gone    — owned but deleted (row still present until the sweep), OR
+	//             purged: no asset row anywhere, yet the caller's own finalized
+	//             ORIGINAL upload with that id exists (finalize turns the upload
+	//             id into the asset id, and upload rows are never removed);
+	//   refused — anything else: another account's asset, or an id that never
+	//             existed. Indistinguishable by design.
+	rows, err := p.pool.Query(ctx, `
+		SELECT r.id,
+		       a.id IS NOT NULL                          AS owned,
+		       a.deleted_at IS NOT NULL                  AS deleted,
+		       (a.id IS NULL
+		        AND NOT EXISTS (SELECT 1 FROM assets x WHERE x.id = r.id)
+		        AND EXISTS (SELECT 1 FROM uploads u
+		                    WHERE u.account = $1 AND u.id = r.id
+		                      AND u.finalized_at IS NOT NULL
+		                      AND u.rendition_asset IS NULL)) AS purged
+		FROM (SELECT DISTINCT unnest($2::text[]) AS id) r
+		LEFT JOIN assets a ON a.id = r.id AND a.account = $1
+		ORDER BY r.id`, account, req.Assets)
 	if err != nil {
 		return plate.Grant{}, err
 	}
-	if owned != len(req.Assets) {
+	var gone []string
+	refused := false
+	for rows.Next() {
+		var (
+			aid                    string
+			owned, deleted, purged bool
+		)
+		if err := rows.Scan(&aid, &owned, &deleted, &purged); err != nil {
+			rows.Close()
+			return plate.Grant{}, err
+		}
+		switch {
+		case owned && deleted, purged:
+			gone = append(gone, aid)
+		case owned:
+		default:
+			refused = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return plate.Grant{}, err
+	}
+	if refused {
 		return plate.Grant{}, ErrForeignAsset
 	}
 
@@ -190,7 +230,26 @@ func (p *Postgres) CreateGrant(ctx context.Context, account string, req plate.Gr
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, account, assets, recipient, created, expires, revoked_at`,
 		gid, account, req.Assets, req.Recipient, created, req.Expires)
-	return scanGrantRow(row)
+	g, err := scanGrantRow(row)
+	if err != nil {
+		return plate.Grant{}, err
+	}
+	if len(gone) > 0 {
+		g.GoneAssets = &gone
+	}
+	return g, nil
+}
+
+// AssetPurged: see the interface doc. Same purged test as CreateGrant's.
+func (p *Postgres) AssetPurged(ctx context.Context, account, assetID string) (bool, error) {
+	var purged bool
+	err := p.pool.QueryRow(ctx, `
+		SELECT NOT EXISTS (SELECT 1 FROM assets WHERE id = $2)
+		   AND EXISTS (SELECT 1 FROM uploads
+		               WHERE account = $1 AND id = $2
+		                 AND finalized_at IS NOT NULL
+		                 AND rendition_asset IS NULL)`, account, assetID).Scan(&purged)
+	return purged, err
 }
 
 // ResolveGrantForDelivery resolves a grant BY ID for the delivery hot path. It
@@ -323,6 +382,31 @@ func (p *Postgres) CreateAccount(ctx context.Context, accountID, bucket, prefix 
 		return fmt.Errorf("store: create account %q: %w", accountID, err)
 	}
 	return nil
+}
+
+// ProvisionAccount is the self-provisioning verb's store half (see the
+// interface doc). Unlike CreateAccount (the operator CLI's upsert, which
+// overwrites bucket/prefix), it NEVER modifies an existing row: DO NOTHING on
+// conflict, then read the row back. Two concurrent first calls both succeed;
+// exactly one reports created=true.
+func (p *Postgres) ProvisionAccount(ctx context.Context, account string) (plate.Account, bool, error) {
+	var a plate.Account
+	err := p.pool.QueryRow(ctx, `
+		INSERT INTO accounts (id) VALUES ($1)
+		ON CONFLICT (id) DO NOTHING
+		RETURNING id, created`, account).Scan(&a.Id, &a.Created)
+	if err == nil {
+		return a, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return plate.Account{}, false, fmt.Errorf("store: provision account: %w", err)
+	}
+	// Conflict: the row already exists. Read it back unchanged.
+	if err := p.pool.QueryRow(ctx, `SELECT id, created FROM accounts WHERE id = $1`, account).
+		Scan(&a.Id, &a.Created); err != nil {
+		return plate.Account{}, false, fmt.Errorf("store: provision account (read back): %w", err)
+	}
+	return a, false, nil
 }
 
 func (p *Postgres) AssetOwnedBy(ctx context.Context, account, assetID string) (bool, error) {

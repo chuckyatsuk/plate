@@ -85,6 +85,10 @@ func TestIsolationCoverage_MatchesContractSecuredOperations(t *testing.T) {
 	// createUpload is secured but has no target resource; it is covered by
 	// TestAccountIsolation_UploadKey_ScopedToCallerAccount instead.
 	covered[string(support.EpCreateUpload)] = true
+	// provisionAccount is secured but targets only the caller's own claim; it is
+	// covered by TestProvisionAccount_* (namespace + scope gates, a foreign
+	// namespace 401s) and TestKeyBinding_BoundKeyCannotActForAnotherAccount.
+	covered[string(support.EpProvisionAccount)] = true
 
 	// Every secured operation must be covered.
 	for _, opID := range secured {
@@ -127,6 +131,7 @@ func TestIsolationCoverage_OnlyProbesAreUnsecured(t *testing.T) {
 		"requestRendition", "getJob", "createUpload", "finalizeUpload",
 		"createGrant", "getGrant", "revokeGrant",
 		"createExport", "getExport", "revokeExport",
+		"provisionAccount",
 	}
 	for _, op := range allOps {
 		if !secured[op] {

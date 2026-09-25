@@ -33,11 +33,27 @@ type Claims struct {
 	Account string   `json:"account"`
 	Scope   []string `json:"scope"`
 	jwt.RegisteredClaims
+
+	// Set by Verify from the key that verified the token — never from the token
+	// body (unexported, so JSON decoding cannot populate them).
+	keyName string          // the kid, or LegacyKeyName for a no-kid token
+	binding *AccountPattern // the key's binding; nil when the key is unbound
 }
+
+// KeyName is the name of the trusted key that verified this token: its kid, or
+// LegacyKeyName for a legacy no-kid token. Empty on claims that were not
+// produced by Verify.
+func (c *Claims) KeyName() string { return c.keyName }
+
+// NamespaceIssuer reports whether the token was verified by a key bound to an
+// account NAMESPACE (a prefix pattern such as "reg_*"). Only such a key may
+// provision accounts: an unbound key could provision anything, and an
+// exact-bound key serves one account an operator already provisioned.
+func (c *Claims) NamespaceIssuer() bool { return c.binding != nil && c.binding.IsPrefix() }
 
 // HasScope reports whether the token carries a given scope. Scopes are
 // first-class from day one (spec Q3): assets:read, assets:write,
-// renditions:generate, grants:manage, assets:export.
+// renditions:generate, grants:manage, assets:export, accounts:provision.
 func (c Claims) HasScope(s string) bool {
 	for _, have := range c.Scope {
 		if have == s {
@@ -64,6 +80,7 @@ func (c Claims) HasScope(s string) bool {
 type Verifier struct {
 	pub      ed25519.PublicKey            // legacy key: verifies tokens with NO kid header
 	keys     map[string]ed25519.PublicKey // named keys: a token's kid selects exactly one
+	bindings map[string]AccountPattern    // key name → the accounts it may claim; absent = unbound
 	issuer   string
 	audience string
 	parser   *jwt.Parser
@@ -128,8 +145,13 @@ var ErrNoAccount = errors.New("auth: token has no account claim")
 // enforces the signing method (EdDSA only, so an attacker cannot downgrade to
 // `alg: none` or an HMAC confusion), the signature, expiry, and iss/aud when
 // configured.
+//
+// After the signature verifies, a key with a binding (NewBoundKeysetVerifier)
+// must also be bound to the token's account claim, else ErrAccountNotBound. A
+// key with no binding accepts any account, exactly as before bindings existed.
 func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 	claims := &Claims{}
+	keyName := ""
 	_, err := v.parser.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodEd25519); !ok {
 			return nil, fmt.Errorf("auth: unexpected signing method %q", t.Header["alg"])
@@ -142,11 +164,13 @@ func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 			if !known {
 				return nil, fmt.Errorf("auth: unknown key id %q", kid)
 			}
+			keyName = kid
 			return key, nil
 		}
 		if v.pub == nil {
 			return nil, errors.New("auth: token has no key id and no legacy key is configured")
 		}
+		keyName = LegacyKeyName
 		return v.pub, nil
 	})
 	if err != nil {
@@ -154,6 +178,16 @@ func (v *Verifier) Verify(tokenString string) (*Claims, error) {
 	}
 	if claims.Account == "" {
 		return nil, ErrNoAccount
+	}
+	// Key → account binding, checked only once the signature is proven (so an
+	// unsigned token learns nothing from it). Strictly narrowing: an unbound key
+	// skips this entirely.
+	claims.keyName = keyName
+	if p, bound := v.bindings[keyName]; bound {
+		if !p.Matches(claims.Account) {
+			return nil, ErrAccountNotBound
+		}
+		claims.binding = &p
 	}
 	return claims, nil
 }

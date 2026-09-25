@@ -120,6 +120,17 @@ func (s *Service) handleResolveDeliveryURL(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// DELETED MEANS NOT SERVED — on EVERY intent, original included. The rule
+	// lives in resolveNonOriginal for the rendition intents, but `original`
+	// branches off before reaching it, so a soft-deleted asset's raw bytes stayed
+	// downloadable on this owner path until the purge sweep. Refuse here, first,
+	// with the same honest answer (delivery:null, reason:deleted).
+	if asset.DeletedAt != nil {
+		reason := plate.ReasonCodeDeleted
+		writeJSON(w, http.StatusOK, plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason})
+		return
+	}
+
 	// original is the named escape hatch (spec §4.1): a short-lived authenticated
 	// download URL, independent of rendition state — it resolves even while an A/V
 	// asset is still probing. It is the OWNER's front door to raw bytes (the caller
@@ -211,8 +222,21 @@ func (s *Service) resolveGranted(w http.ResponseWriter, r *http.Request, grantID
 	// the right key space and re-confirms the asset still exists.
 	asset, err := s.store.GetAsset(r.Context(), verdict.Account, assetID)
 	if err != nil {
-		// The asset was deleted after the grant was issued (or any read error):
-		// nothing to deliver. Treat as the honest refusal, not a 500 leak.
+		// A PURGED asset (deleted, then its row removed by the sweep) is in this
+		// live grant's frozen set because its owner put it there: answer what it
+		// is — deleted — exactly as before the sweep ran, so a caller treats it
+		// as permanently gone instead of retrying an "unauthorized" forever. The
+		// check is under the GRANT's account and only reached for a covered id,
+		// so it reveals nothing about any other account or any uncovered id.
+		if errors.Is(err, store.ErrNotFound) {
+			if purged, perr := s.store.AssetPurged(r.Context(), verdict.Account, assetID); perr == nil && purged {
+				reason := plate.ReasonCodeDeleted
+				writeJSON(w, http.StatusOK, plate.DeliveryResolution{Intent: intent, Delivery: nil, Reason: &reason})
+				return
+			}
+		}
+		// Any other read failure: nothing to deliver. Treat as the honest
+		// refusal, not a 500 leak.
 		unauthorized()
 		return
 	}
@@ -254,6 +278,29 @@ func (s *Service) enforceGranted(d *plate.Delivery, asset plate.Asset, grantID s
 	exp := time.Now().Add(s.grantURLTTL)
 	d.Mode = plate.Granted
 	d.Expires = &exp
+
+	// A VIDEO's image-ladder intents (thumbnail/grid/lightbox) are its POSTER,
+	// bounded through imgproxy — exactly as public delivery serves them
+	// (resolveNonOriginal), only signed with an expiry. Without this they fell to
+	// the A/V branch below, which signs a /v1/download of
+	// delivery/{acct}/{asset}/lightbox: an object the worker never writes, so
+	// every granted video still 404'd (PKG-2). It must never be the raw poster
+	// either — that is the full-resolution keyframe the ladder exists to bound.
+	// resolveNonOriginal only hands us a delivery when the poster is READY; a
+	// pending/not_derived poster already returned its honest refusal.
+	if asset.Kind == plate.Video && isImageLadderIntent(intent) {
+		poster, ok := findRendition(asset, plate.Poster)
+		if !ok || poster.Status != plate.RenditionStatus("ready") {
+			return nil, false // unreachable via resolveGranted; fail closed regardless
+		}
+		u, ok := s.signedImageURL(imagePreset(intent, device, poster.Width, poster.Height),
+			id.RenditionKey(asset.Vault.Key, string(plate.Poster)), &exp)
+		if !ok {
+			return nil, false
+		}
+		d.Url = u
+		return d, true
+	}
 
 	switch asset.Kind {
 	case plate.Image:
@@ -372,6 +419,20 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 			deny()
 			return
 		}
+		// An original URL minted BEFORE the owner deleted the asset must stop at
+		// the moment deleted_at is set, not when its signature expires. The
+		// signed key is vault/{account}/{asset}, so the asset is re-read under
+		// the account the key itself names (the signature binds the key).
+		acct, assetID, ok := vaultKeyParts(key)
+		if !ok {
+			deny()
+			return
+		}
+		a, err := s.store.GetAsset(r.Context(), acct, assetID)
+		if err != nil || a.DeletedAt != nil {
+			deny()
+			return
+		}
 	} else {
 		// Granted A/V: signature must verify AND the grant must still be live NOW.
 		if grantID == "" || !s.signer.verify(signedURL, intent, grantID) {
@@ -454,6 +515,16 @@ func assetIDFromRenditionKey(key string) string {
 		return parts[2] // vault/{account}/{asset} (original download)
 	}
 	return ""
+}
+
+// vaultKeyParts splits a vault key `vault/{account}/{asset}` into its account
+// and asset id; ok is false for any other shape.
+func vaultKeyParts(key string) (account, assetID string, ok bool) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 3 || parts[0]+"/" != id.VaultPrefix || parts[1] == "" || parts[2] == "" {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
 }
 
 // imagePreset maps an image intent + device class to the imgproxy PRESET name to
@@ -850,7 +921,9 @@ func (s *Service) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// CreateGrant verifies EVERY asset belongs to the caller; a grant over a
-	// B-owned asset is refused wholesale (ErrForeignAsset → 403).
+	// B-owned (or never-existing) asset is refused wholesale (ErrForeignAsset →
+	// 403). The caller's own deleted/purged assets do not refuse the set: they
+	// come back in gone_assets and resolve `deleted`.
 	grant, err := s.store.CreateGrant(r.Context(), account(r), req)
 	if mapStoreErr(w, err) {
 		return

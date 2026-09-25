@@ -125,6 +125,11 @@ var knownScopes = map[string]bool{
 	"renditions:generate": true,
 	"grants:manage":       true,
 	"assets:export":       true,
+	// accounts:provision lets a NAMESPACE issuer create accounts inside its
+	// namespace (PUT /v1/account). The server honours it only from a key bound
+	// by a prefix pattern in PLATE_JWT_KEY_ACCOUNTS (e.g. registry=reg_*); from
+	// an unbound or exact-bound key it is refused 403.
+	"accounts:provision": true,
 }
 
 // mintToken is the operator subcommand that issues a scoped service token:
@@ -146,7 +151,7 @@ var knownScopes = map[string]bool{
 // beyond a throwaway smoke.
 func mintToken() error {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
-	scopesCSV := fs.String("scopes", "", "comma-separated scopes (assets:read,assets:write,renditions:generate,grants:manage,assets:export)")
+	scopesCSV := fs.String("scopes", "", "comma-separated scopes (assets:read,assets:write,renditions:generate,grants:manage,assets:export,accounts:provision)")
 	ttlStr := fs.String("ttl", "720h", "token lifetime, e.g. 90d, 720h, 30m (bounded; the token always expires)")
 	sub := fs.String("sub", "operator", "the token's subject claim (a label for who/what it is for)")
 	kid := fs.String("kid", "", "key id: names the signing key in the token's kid header, so the server verifies it against PLATE_JWT_PUBLIC_KEYS[kid] — retiring that kid revokes the token. Empty mints a legacy no-kid token (verified by PLATE_JWT_PUBLIC_KEY).")
@@ -169,7 +174,7 @@ func mintToken() error {
 	}
 	for _, s := range scopes {
 		if !knownScopes[s] {
-			return fmt.Errorf("unknown scope %q (known: assets:read, assets:write, renditions:generate, grants:manage, assets:export)", s)
+			return fmt.Errorf("unknown scope %q (known: assets:read, assets:write, renditions:generate, grants:manage, assets:export, accounts:provision)", s)
 		}
 	}
 
@@ -345,6 +350,10 @@ func serve(log *slog.Logger) error {
 	if !cfg.Verifier.Configured() {
 		log.Warn("no token validation key configured (PLATE_JWT_PUBLIC_KEY / PLATE_JWT_PUBLIC_KEYS empty) — every authenticated request will 401")
 	}
+	// Key → account bindings: WARN for every trusted key that can still sign for
+	// any account (unset PLATE_JWT_KEY_ACCOUNTS leaves them all unbound, which is
+	// legal and unchanged — but never silent).
+	service.LogKeyBindings(log, cfg.Verifier)
 	if cfg.DeliverySigningKey == "" {
 		log.Warn("PLATE_DELIVERY_SIGNING_KEY is empty — granted A/V, owner-original downloads, and exports will refuse (503); check the deployed secret is not present-but-empty")
 	}

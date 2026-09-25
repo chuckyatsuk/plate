@@ -69,6 +69,8 @@ tags:
     description: First-class access records for share links, packages, consignments.
   - name: exports
     description: Long-lived, revocable owner capabilities for original bytes (archives, manifests).
+  - name: accounts
+    description: Self-provisioning of the caller's own account by a namespace issuer.
   - name: system
     description: Health and readiness.
 
@@ -438,6 +440,17 @@ paths:
         One grant per SET (package/share link) — never per file (spec Q3). The
         set is frozen at issue time; adding an asset later is a new grant. Plate
         holds the grant; the caller owns *why* it exists.
+
+        Every asset in the set must belong to the caller. An id that is not the
+        caller's — another account's, or one that never existed — refuses the
+        WHOLE set `403`, without naming which id (no existence oracle).
+
+        An id that IS the caller's but is GONE — deleted (`deleteAsset`), or
+        already purged by the reconcile sweep — does not refuse the set: the
+        grant is created over the full requested set, the gone ids are listed in
+        `gone_assets`, and resolving any of them through the grant answers
+        `delivery: null, reason: deleted` (whether or not the sweep has run
+        yet). One gone asset therefore never takes a whole share down with it.
       requestBody:
         required: true
         content:
@@ -446,7 +459,7 @@ paths:
               $ref: '#/components/schemas/GrantRequest'
       responses:
         '201':
-          description: The grant.
+          description: The grant. `gone_assets` lists any ids in the set that are deleted or purged.
           content:
             application/json:
               schema:
@@ -455,6 +468,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -608,6 +623,48 @@ paths:
           $ref: '#/components/responses/NotFound'
 
   # ───────────────────────────────────────────────────────────────────────────
+  # Accounts — self-provisioning by a namespace issuer (security batch, T2/T3)
+  # ───────────────────────────────────────────────────────────────────────────
+  /account:
+    put:
+      tags: [accounts]
+      operationId: provisionAccount
+      summary: Ensure the caller's own account exists (idempotent).
+      description: |
+        Creates the account named by the token's `account` claim if it does not
+        exist yet. There is **no account parameter**: the account is the claim,
+        as everywhere else in this contract (spec Q3.A).
+
+        Requires the `accounts:provision` scope **and** a token signed by a key
+        bound to an account NAMESPACE (a prefix pattern such as `reg_*` in the
+        deployment's key → account bindings). An unbound key, or a key bound to
+        one exact account, is refused `403` even with the scope — so this verb can
+        only ever create accounts inside the namespace an operator delegated.
+
+        Idempotent and non-destructive: an existing account is returned unchanged
+        (`created: false`) — never re-configured. Operators still provision
+        through the `plate accounts create` CLI. The request has no body.
+      responses:
+        '201':
+          description: The account was created by this call.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountProvisioning'
+        '200':
+          description: The account already existed; nothing was changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountProvisioning'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ───────────────────────────────────────────────────────────────────────────
   # System — twelve-factor / K8s-ready (spec Q4)
   # ───────────────────────────────────────────────────────────────────────────
   /healthz:
@@ -657,8 +714,13 @@ components:
         `exp`, plus `account` and `scope`. **The `account` claim is the only
         source of the caller's account** — never a request parameter. Scopes are
         first-class: `assets:read`, `assets:write`, `renditions:generate`,
-        `grants:manage`, `assets:export`. Issuance is separable from validation
-        (OAuth-shaped, not OAuth-implemented).
+        `grants:manage`, `assets:export`, `accounts:provision`. Issuance is
+        separable from validation (OAuth-shaped, not OAuth-implemented).
+
+        A deployment may BIND a signing key to the accounts it may claim (an
+        exact account id, or a namespace prefix). A token whose account claim
+        falls outside its key's binding is rejected `401`, exactly like any other
+        invalid token.
 
   parameters:
     AssetIdPath:
@@ -891,7 +953,7 @@ components:
 
     Scope:
       type: string
-      enum: [assets:read, assets:write, renditions:generate, grants:manage, assets:export]
+      enum: [assets:read, assets:write, renditions:generate, grants:manage, assets:export, accounts:provision]
 
     # ── Delivery ─────────────────────────────────────────────────────────────
     DeliveryResolution:
@@ -1345,6 +1407,15 @@ components:
             - type: string
               format: date-time
             - type: 'null'
+        gone_assets:
+          type: array
+          description: |
+            Only on the `createGrant` response: the ids in `assets` that were
+            already gone (deleted, or purged by the sweep) when the grant was
+            issued. They stay in the frozen set and resolve `reason: deleted`.
+            Absent when none are gone.
+          items:
+            $ref: '#/components/schemas/AssetId'
         access_log:
           type: array
           description: Observability — "opened 14 times, last Tuesday" (spec Q3).
@@ -1450,6 +1521,30 @@ components:
           type: string
           format: date-time
           description: Same as the export's expiry — the URL's signature dies with the export.
+
+    # ── Accounts ─────────────────────────────────────────────────────────────
+    Account:
+      type: object
+      additionalProperties: false
+      description: An account row — an opaque id and when it was created. Plate models no users or roles.
+      required: [id, created]
+      properties:
+        id:
+          $ref: '#/components/schemas/AccountId'
+        created:
+          type: string
+          format: date-time
+
+    AccountProvisioning:
+      type: object
+      additionalProperties: false
+      required: [account, created]
+      properties:
+        account:
+          $ref: '#/components/schemas/Account'
+        created:
+          type: boolean
+          description: True when THIS call created the account; false when it already existed (and was left unchanged).
 
     # ── System & errors ──────────────────────────────────────────────────────
     Health:

@@ -80,10 +80,20 @@ type Store interface {
 	// RevokeGrant revokes an owned grant; ErrNotFound if not owned.
 	RevokeGrant(ctx context.Context, account, grantID string) (plate.Grant, error)
 
-	// CreateGrant creates a grant over a set of assets. It verifies EVERY asset
-	// in the set belongs to account; any foreign asset → ErrForeignAsset (no
-	// partial grant, and no leak of which asset was foreign).
+	// CreateGrant creates a grant over a set of assets. Every id in the set must
+	// be the account's: live, deleted, or PURGED (the sweep removed the row but
+	// the account's finalized upload still records the id). Any other id —
+	// foreign or never existed — refuses the whole set with ErrForeignAsset (no
+	// partial grant, no leak of which id). Deleted and purged ids stay in the
+	// frozen set and are reported in the returned Grant's GoneAssets.
 	CreateGrant(ctx context.Context, account string, req plate.GrantRequest) (plate.Grant, error)
+
+	// AssetPurged reports whether assetID was once an asset of account that the
+	// deleted-asset sweep has since purged: no asset row remains, but the
+	// account's finalized ORIGINAL upload (whose id became the asset id) does.
+	// Delivery uses it to answer `deleted` rather than a not-found for a purged
+	// id inside a live grant. Account-scoped like every read.
+	AssetPurged(ctx context.Context, account, assetID string) (bool, error)
 
 	// ResolveGrantForDelivery looks a grant up BY GRANT ID ALONE — deliberately
 	// NOT account-scoped — because a grant IS the capability: it carries its own
@@ -127,6 +137,15 @@ type Store interface {
 	// every fetch with NO cache (exports are low-volume), so revocation is
 	// immediate. Returns only a verdict + the export's own account.
 	ResolveExportForDelivery(ctx context.Context, exportID, assetID string) (ExportVerdict, error)
+
+	// ProvisionAccount ensures the CALLER's own account row exists (PUT
+	// /v1/account). The account is the caller's token claim — like every method
+	// here it takes no other account. Idempotent and non-destructive: INSERT …
+	// ON CONFLICT DO NOTHING, so an existing row (and its operator-set storage
+	// config) is never touched. created reports whether THIS call inserted it.
+	// Who may call it at all (a namespace-bound key with accounts:provision) is
+	// the service's check, not the store's.
+	ProvisionAccount(ctx context.Context, account string) (acct plate.Account, created bool, err error)
 
 	// ── write path (Phase 2) ────────────────────────────────────────────────
 

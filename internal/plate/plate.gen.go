@@ -260,9 +260,27 @@ type AccessLogEntry struct {
 	Intent *Intent `json:"intent,omitempty"`
 }
 
+// Account An account row — an opaque id and when it was created. Plate models no users or roles.
+type Account struct {
+	Created time.Time `json:"created"`
+
+	// Id Opaque foreign reference (spec Q2). Plate stores an id plus storage
+	// config — NO users, roles, or permissions. Identity is a separate concern.
+	Id AccountId `json:"id"`
+}
+
 // AccountId Opaque foreign reference (spec Q2). Plate stores an id plus storage
 // config — NO users, roles, or permissions. Identity is a separate concern.
 type AccountId = string
+
+// AccountProvisioning defines model for AccountProvisioning.
+type AccountProvisioning struct {
+	// Account An account row — an opaque id and when it was created. Plate models no users or roles.
+	Account Account `json:"account"`
+
+	// Created True when THIS call created the account; false when it already existed (and was left unchanged).
+	Created bool `json:"created"`
+}
 
 // Asset One uploaded file: exactly one immutable vault object, plus zero or more
 // renditions. Account-scoped. Note the vault object has NO delivery URL
@@ -484,7 +502,13 @@ type Grant struct {
 	Assets  []AssetId `json:"assets"`
 	Created time.Time `json:"created"`
 	Expires time.Time `json:"expires"`
-	Id      GrantId   `json:"id"`
+
+	// GoneAssets Only on the `createGrant` response: the ids in `assets` that were
+	// already gone (deleted, or purged by the sweep) when the grant was
+	// issued. They stay in the frozen set and resolve `reason: deleted`.
+	// Absent when none are gone.
+	GoneAssets *[]AssetId `json:"gone_assets,omitempty"`
+	Id         GrantId    `json:"id"`
 
 	// Recipient Optional opaque recipient label, or null.
 	Recipient *string `json:"recipient,omitempty"`

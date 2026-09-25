@@ -42,6 +42,7 @@ import (
 	"github.com/chuckyatsuk/plate/test/support"
 
 	"github.com/golang-jwt/jwt/v5"
+	testcontainers "github.com/testcontainers/testcontainers-go"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
@@ -396,8 +397,9 @@ func storeForTest(t *testing.T) *store.Postgres {
 // The container is terminated when the process exits (tests own the lifetime).
 func startStorageForWiring(ctx context.Context) (*storage.S3, *probe.Prober, error) {
 	const user, pass, bucket = "plate", "plate-secret", "plate-isolation"
-	c, err := tcminio.Run(ctx, "minio/minio:latest",
-		tcminio.WithUsername(user), tcminio.WithPassword(pass))
+	c, err := tcminio.Run(ctx, harness.MinIOImage,
+		tcminio.WithUsername(user), tcminio.WithPassword(pass),
+		testcontainers.WithImagePlatform("linux/amd64"))
 	if err != nil {
 		return nil, nil, err
 	}
