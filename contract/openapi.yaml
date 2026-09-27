@@ -549,7 +549,12 @@ paths:
           storage-presigned hop behind the redirect stays seconds-short.
 
         The set is frozen at issue time, like a grant: adding an asset later is a
-        new export.
+        new export. Ids are a SET: a duplicate is covered once. The caller's own
+        deleted or purged assets are left out of the frozen set and listed in
+        `gone_assets`; an id that is not the caller's (another account's, or one
+        that never existed) refuses the whole request with the same `403`,
+        naming no id. A download of an asset deleted after the export was issued
+        is refused from the moment of the delete.
       requestBody:
         required: true
         content:
@@ -571,6 +576,14 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            `assets_gone`: every requested id is the caller's own but none is
+            live (each deleted or purged), so there is nothing to export.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /exports/{exportId}:
     get:
@@ -1059,6 +1072,15 @@ components:
           type: string
           description: Human-readable original filename. Metadata, not identity.
           maxLength: 1024
+        content_type:
+          type: string
+          maxLength: 255
+          description: |
+            The media type the original was uploaded as: the `content_type`
+            declared at `createUpload`, which the presigned PUT is signed with,
+            so it is the stored object's Content-Type. Absent when Plate holds
+            no upload record for the asset (an asset seeded directly rather than
+            brokered through `createUpload`); never guessed from `kind`.
         vault:
           $ref: '#/components/schemas/VaultObject'
         renditions:
@@ -1082,7 +1104,7 @@ components:
         The immutable original. Probed metadata only — deliberately NO url field.
         The single most important schema in this contract: the absence is the
         design. Asking for a delivery URL here is a type error (spec §3.1).
-      required: [key, checksum, size_bytes]
+      required: [key, checksum, checksum_verified, size_bytes]
       properties:
         key:
           type: string
@@ -1090,8 +1112,23 @@ components:
           maxLength: 1024
         checksum:
           type: string
-          description: Content checksum recorded at ingest (e.g. sha256:...).
+          description: |
+            The vault object's checksum, algorithm-prefixed, and only ever a
+            value Plate verified itself (never a client's unverified claim).
+            `sha256:<64 hex>` once Plate has streamed the stored object and
+            hashed it (every object is hashed server-side, shortly after
+            finalize; assets that predate this are hashed by a backfill).
+            Before that it is `md5:<32 hex>` when the client declared an md5
+            that matched the stored object's single-part ETag at finalize, and
+            empty otherwise. `checksum_verified` says whether it holds a value.
           maxLength: 128
+        checksum_verified:
+          type: boolean
+          description: |
+            True when `checksum` holds a value Plate confirmed against the
+            stored bytes (a server-computed `sha256:`, or an `md5:` matched to
+            the ETag). False while the object awaits hashing; `checksum` is then
+            empty.
         size_bytes:
           type: integer
           format: int64
@@ -1496,6 +1533,16 @@ components:
             - type: string
               format: date-time
             - type: 'null'
+        gone_assets:
+          type: array
+          description: |
+            Only on the `createExport` response: requested ids that are the
+            caller's own but were already gone (deleted, or purged by the sweep)
+            when the export was issued, in request order. They are NOT in
+            `assets` and get no download: an export serves only live originals.
+            Absent when none are gone.
+          items:
+            $ref: '#/components/schemas/AssetId'
         downloads:
           type: array
           description: |

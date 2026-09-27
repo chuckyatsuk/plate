@@ -68,6 +68,10 @@ func mapStoreErr(w http.ResponseWriter, err error) bool {
 		// A grant over an asset the caller does not own. Deny without echoing
 		// which asset was foreign.
 		writeError(w, http.StatusForbidden, "forbidden", "one or more assets are not owned by this account")
+	case errors.Is(err, store.ErrAssetsGone):
+		// An export over the caller's own ids, every one deleted or purged.
+		// The ids are the caller's, so the named refusal leaks nothing.
+		writeError(w, http.StatusConflict, "assets_gone", "every requested asset is deleted or purged; nothing to export")
 	case errors.Is(err, store.ErrUploadGone):
 		// The upload's orphaned bytes were reclaimed by the sweep before finalize;
 		// the resource is permanently gone (start a fresh upload).
@@ -400,14 +404,25 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		// Re-check the export row LIVE on every fetch — deliberately uncached
 		// (exports are low-volume), so revocation stops an already-issued URL on
-		// the very next download, not one cache window later.
-		assetID := assetIDFromRenditionKey(key)
-		if assetID == "" {
+		// the very next download, not one cache window later. An export only
+		// ever signs a vault key, vault/{account}/{asset}.
+		acct, assetID, ok := vaultKeyParts(key)
+		if !ok {
 			deny()
 			return
 		}
 		verdict, err := s.store.ResolveExportForDelivery(r.Context(), exportID, assetID)
-		if err != nil || !verdict.Live() {
+		if err != nil || !verdict.Live() || verdict.Account != acct {
+			deny()
+			return
+		}
+		// DELETED MEANS NOT SERVED, here too: an export URL minted while the
+		// asset was live stops at the moment deleted_at is set, exactly like
+		// the owner-original branch below — not when the export expires, and
+		// not when the sweep finally removes the bytes. Re-read under the
+		// export's own account (the row, not the request, says whose it is).
+		a, err := s.store.GetAsset(r.Context(), verdict.Account, assetID)
+		if err != nil || a.DeletedAt != nil {
 			deny()
 			return
 		}

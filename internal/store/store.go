@@ -31,6 +31,13 @@ var ErrNotFound = errors.New("store: not found for this account")
 // maps it to a denial without echoing the foreign id.
 var ErrForeignAsset = errors.New("store: asset not owned by this account")
 
+// ErrAssetsGone is returned by CreateExport when every requested id is the
+// caller's own but none is live (each one deleted or purged): an export over
+// nothing is not an export. The ids are the caller's, so naming the condition
+// leaks nothing; a set with any foreign id is ErrForeignAsset first. The service
+// maps it to 409 assets_gone.
+var ErrAssetsGone = errors.New("store: every requested asset is deleted or purged")
+
 // ErrUnknownAccount is returned when a write references an account that has no
 // row yet (uploads.account's FK). It means the account was never provisioned
 // (`plate accounts create`), NOT a server fault — the service maps it to a
@@ -125,9 +132,12 @@ type Store interface {
 	// RevokeExport revokes an owned export; ErrNotFound if not owned.
 	RevokeExport(ctx context.Context, account, exportID string) (plate.Export, error)
 
-	// CreateExport creates an export over a set of assets. Like CreateGrant, it
-	// verifies EVERY asset in the set belongs to account; any foreign asset →
-	// ErrForeignAsset (no partial export, no leak of which asset was foreign).
+	// CreateExport creates an export over a set of assets, classified exactly
+	// like CreateGrant (distinct ids; live / gone / refused). Any foreign or
+	// never-existed id → ErrForeignAsset (no partial export, no leak of which).
+	// The caller's deleted or purged ids are NOT frozen into the export — there
+	// are no bytes it may serve for them — and are reported in the returned
+	// Export's GoneAssets. If nothing live remains → ErrAssetsGone.
 	CreateExport(ctx context.Context, account string, req plate.ExportRequest) (plate.Export, error)
 
 	// ResolveExportForDelivery looks an export up BY EXPORT ID ALONE for the

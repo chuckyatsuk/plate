@@ -289,7 +289,14 @@ type Asset struct {
 	// Account Opaque foreign reference (spec Q2). Plate stores an id plus storage
 	// config — NO users, roles, or permissions. Identity is a separate concern.
 	Account AccountId `json:"account"`
-	Created time.Time `json:"created"`
+
+	// ContentType The media type the original was uploaded as: the `content_type`
+	// declared at `createUpload`, which the presigned PUT is signed with,
+	// so it is the stored object's Content-Type. Absent when Plate holds
+	// no upload record for the asset (an asset seeded directly rather than
+	// brokered through `createUpload`); never guessed from `kind`.
+	ContentType *string   `json:"content_type,omitempty"`
+	Created     time.Time `json:"created"`
 
 	// DeletedAt Set when deletion has been requested; bytes reconciled asynchronously.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
@@ -445,7 +452,14 @@ type Export struct {
 	// dead export cannot hand them out.
 	Downloads *[]ExportDownload `json:"downloads,omitempty"`
 	Expires   time.Time         `json:"expires"`
-	Id        ExportId          `json:"id"`
+
+	// GoneAssets Only on the `createExport` response: requested ids that are the
+	// caller's own but were already gone (deleted, or purged by the sweep)
+	// when the export was issued, in request order. They are NOT in
+	// `assets` and get no download: an export serves only live originals.
+	// Absent when none are gone.
+	GoneAssets *[]AssetId `json:"gone_assets,omitempty"`
+	Id         ExportId   `json:"id"`
 
 	// Note Optional opaque label, or null.
 	Note *string `json:"note,omitempty"`
@@ -861,10 +875,23 @@ type UploadTicketMethod string
 // The single most important schema in this contract: the absence is the
 // design. Asking for a delivery URL here is a type error (spec §3.1).
 type VaultObject struct {
-	// Checksum Content checksum recorded at ingest (e.g. sha256:...).
-	Checksum  string  `json:"checksum"`
-	Codec     *string `json:"codec,omitempty"`
-	Container *string `json:"container,omitempty"`
+	// Checksum The vault object's checksum, algorithm-prefixed, and only ever a
+	// value Plate verified itself (never a client's unverified claim).
+	// `sha256:<64 hex>` once Plate has streamed the stored object and
+	// hashed it (every object is hashed server-side, shortly after
+	// finalize; assets that predate this are hashed by a backfill).
+	// Before that it is `md5:<32 hex>` when the client declared an md5
+	// that matched the stored object's single-part ETag at finalize, and
+	// empty otherwise. `checksum_verified` says whether it holds a value.
+	Checksum string `json:"checksum"`
+
+	// ChecksumVerified True when `checksum` holds a value Plate confirmed against the
+	// stored bytes (a server-computed `sha256:`, or an `md5:` matched to
+	// the ETag). False while the object awaits hashing; `checksum` is then
+	// empty.
+	ChecksumVerified bool    `json:"checksum_verified"`
+	Codec            *string `json:"codec,omitempty"`
+	Container        *string `json:"container,omitempty"`
 
 	// DurationS Probed duration in seconds (audio/video).
 	DurationS *float64 `json:"duration_s,omitempty"`

@@ -115,8 +115,10 @@ func (s *Service) handleCreateExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "expires exceeds the 30-day export cap")
 		return
 	}
-	// CreateExport verifies EVERY asset belongs to the caller; an export over a
-	// foreign asset is refused wholesale (ErrForeignAsset → 403), like grants.
+	// CreateExport classifies the set like a grant: a foreign or never-existed
+	// id refuses it wholesale (ErrForeignAsset → 403, no id named); the caller's
+	// deleted or purged ids are left out and reported in gone_assets; nothing
+	// live left → ErrAssetsGone (409).
 	export, err := s.store.CreateExport(r.Context(), account(r), req)
 	if mapStoreErr(w, err) {
 		return

@@ -25,7 +25,11 @@ type ClaimedJob struct {
 	Asset    string
 	Intent   plate.Intent
 	VaultKey string // the asset's {account}/{asset-id} storage key — the transcode source
-	Attempts int32
+	// VaultSize is the vault object's size as recorded at finalize (HEAD). The
+	// worker hashes the original while it downloads it and records the SHA-256
+	// only when exactly this many bytes were read.
+	VaultSize int64
+	Attempts  int32
 	// Mode is 'derive' (transcode the vault original) or 'remux' (stream-copy an
 	// authored file — Tier 2 V4.1). Empty is treated as 'derive' by the worker.
 	Mode string
@@ -185,8 +189,8 @@ func (p *Postgres) ClaimNextJob(ctx context.Context, leaseTTL time.Duration) (Cl
 	// Fetch the asset's vault key (the transcode source), scoped to the job's
 	// account. A job can only ever reference its own account's asset.
 	if err := p.pool.QueryRow(ctx, `
-		SELECT vault_key FROM assets WHERE account = $1 AND id = $2`,
-		cj.Account, cj.Asset).Scan(&cj.VaultKey); err != nil {
+		SELECT vault_key, vault_size_bytes FROM assets WHERE account = $1 AND id = $2`,
+		cj.Account, cj.Asset).Scan(&cj.VaultKey, &cj.VaultSize); err != nil {
 		return ClaimedJob{}, fmt.Errorf("store: claimed job %s: load vault key: %w", cj.ID, err)
 	}
 	return cj, nil
@@ -337,16 +341,6 @@ func (p *Postgres) BackfillVaultProbe(ctx context.Context, assetID string, v Vau
 func (p *Postgres) MarkProbeFailed(ctx context.Context, assetID string) error {
 	_, err := p.pool.Exec(ctx,
 		`UPDATE assets SET probe_status = 'failed' WHERE id = $1`, assetID)
-	return err
-}
-
-// MarkChecksumVerified records that the stored object's checksum was confirmed
-// (server-side, ETag, or worker hash) and stores the verified value. Never called
-// with an unverified client claim (review ruling 2).
-func (p *Postgres) MarkChecksumVerified(ctx context.Context, assetID, checksum string) error {
-	_, err := p.pool.Exec(ctx,
-		`UPDATE assets SET vault_checksum = $2, checksum_verified = true WHERE id = $1`,
-		assetID, checksum)
 	return err
 }
 

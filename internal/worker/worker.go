@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -205,10 +207,15 @@ func (w *Worker) process(ctx context.Context, job store.ClaimedJob) error {
 	}
 
 	// Pull the vault original from storage (server-to-server; the worker holds the
-	// derivative-path credentials, spec §5.1).
-	if err := w.download(ctx, job.VaultKey, srcPath); err != nil {
+	// derivative-path credentials, spec §5.1). The bytes pass through here anyway,
+	// so they are hashed on the way to disk: the SHA-256 of the stored object,
+	// recorded as the verified vault checksum (no second read of a multi-GB
+	// master).
+	sum, n, err := w.downloadHashed(ctx, job.VaultKey, srcPath)
+	if err != nil {
 		return fmt.Errorf("pull vault original: %w", err)
 	}
+	recordChecksum(ctx, w.store, w.log, job.Asset, sum, n, job.VaultSize)
 
 	// PROBE FIRST (review ruling 1): the A/V asset was created probe_status=pending
 	// at finalize (the API has no ffprobe). Probe it here, backfill the vault
@@ -284,9 +291,9 @@ const (
 	// phone. (The DERIVED loop is still produced at 640 — that's what Plate makes for a
 	// grid tile; this cap governs only what an AUTHORED file is allowed to be.)
 	authoredLoopMaxEdge     = 1920
-	authoredLoopMaxDuration = 30.0              // seconds — viewer cap, not compute
-	authoredDetailMaxBPS    = 8 * 1_000_000     // 8 Mbps
-	authoredLoopMaxBPS      = 2 * 1_000_000     // 2 Mbps
+	authoredLoopMaxDuration = 30.0                   // seconds — viewer cap, not compute
+	authoredDetailMaxBPS    = 8 * 1_000_000          // 8 Mbps
+	authoredLoopMaxBPS      = 2 * 1_000_000          // 2 Mbps
 	authoredMaxBytes        = 2 * 1024 * 1024 * 1024 // 2 GiB storage backstop
 )
 
@@ -409,7 +416,7 @@ func authoredCeilingBreach(intent plate.Intent, pr probe.Result) (plate.ReasonCo
 }
 
 func isH264(codec string) bool { return codec == "h264" }
-func isAAC(codec string) bool   { return codec == "aac" }
+func isAAC(codec string) bool  { return codec == "aac" }
 func longEdge(w, h int) int {
 	if w > h {
 		return w
@@ -472,6 +479,27 @@ func (w *Worker) download(ctx context.Context, key, dst string) error {
 	defer f.Close()
 	_, err = io.Copy(f, body)
 	return err
+}
+
+// downloadHashed is download with a SHA-256 of the bytes computed as they are
+// written (a tee, never a buffer). Returns "sha256:<hex>" and the byte count.
+func (w *Worker) downloadHashed(ctx context.Context, key, dst string) (string, int64, error) {
+	body, err := w.storage.Get(ctx, key)
+	if err != nil {
+		return "", 0, err
+	}
+	defer body.Close()
+	f, err := os.Create(dst)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), body)
+	if err != nil {
+		return "", n, err
+	}
+	return store.ChecksumPrefix + hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
 func (w *Worker) upload(ctx context.Context, src, key, ctype string) error {
