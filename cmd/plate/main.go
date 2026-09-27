@@ -32,7 +32,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: plate <serve|work|accounts|token|keypair|imgproxy-presets>")
+		fmt.Fprintln(os.Stderr, "usage: plate <serve|work|accounts|checksums|token|keypair|imgproxy-presets>")
 		os.Exit(2)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)) // structured logs to stdout (twelve-factor)
@@ -59,6 +59,11 @@ func main() {
 			log.Error("accounts failed", "err", err)
 			os.Exit(1)
 		}
+	case "checksums":
+		if err := checksums(log); err != nil {
+			log.Error("checksums failed", "err", err)
+			os.Exit(1)
+		}
 	case "token":
 		if err := mintToken(); err != nil {
 			log.Error("token failed", "err", err)
@@ -70,7 +75,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work|accounts|token|keypair|imgproxy-presets)\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "plate: unknown command %q (want serve|work|accounts|checksums|token|keypair|imgproxy-presets)\n", os.Args[1])
 		os.Exit(2)
 	}
 }
@@ -444,6 +449,20 @@ func work(log *slog.Logger) error {
 	)
 	go reconciler.SweepLoop(ctx, parseDurationEnv("PLATE_SWEEP_EVERY", 15*time.Minute))
 
+	// The checksum sweep (Exit support): hashes every vault object that lacks a
+	// verified sha256 — new images/documents within about one interval, and the
+	// pre-existing backlog (the backfill) in its first passes — streaming, at a
+	// rate cap. PLATE_CHECKSUM_EVERY=0s turns it off (the operator can still
+	// run `plate checksums run`); PLATE_CHECKSUM_RATE_MBPS caps it (MiB/s).
+	if every := parseDurationEnv("PLATE_CHECKSUM_EVERY", time.Minute); every > 0 {
+		cs := worker.NewChecksummer(st, sc.Storage, log, worker.ChecksumConfig{
+			RateBytesPerSec: parseMiBpsEnv("PLATE_CHECKSUM_RATE_MBPS", worker.DefaultChecksumRate),
+		})
+		go cs.Loop(ctx, every)
+	} else {
+		log.Warn("checksum sweep disabled (PLATE_CHECKSUM_EVERY=0): new images and documents get no server-side sha256 until it is re-enabled or `plate checksums run` is used")
+	}
+
 	// Liveness heartbeat (Tier 1 monitoring): the worker has no HTTP surface, so
 	// this row in worker_heartbeats is the ONLY way /readyz — and therefore the
 	// external monitor — can tell a running worker from zero machines. Worker id
@@ -477,6 +496,103 @@ func work(log *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+// parseMiBpsEnv reads a throughput in MiB/s from an env var as bytes/s,
+// falling back to def on absent/invalid. "0" means unthrottled.
+func parseMiBpsEnv(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		var mib float64
+		if _, err := fmt.Sscanf(v, "%g", &mib); err == nil && mib >= 0 {
+			if mib == 0 {
+				return -1
+			}
+			return int64(mib * (1 << 20))
+		}
+	}
+	return def
+}
+
+// checksums is the operator subcommand for the server-side sha256 of vault
+// objects (Exit support):
+//
+//	plate checksums status
+//	plate checksums run [--rate-mbps 16] [--max N]
+//
+// status reports the backlog (counts and bytes, no ids). run is the BACKFILL:
+// it hashes every live asset still lacking a verified sha256, one streamed
+// object at a time at the rate cap, and exits when none remain. It is the same
+// Checksummer the worker's sweep runs, so running it beside the worker is safe
+// (claims are SKIP LOCKED) and stopping it anywhere is safe (progress is the
+// column itself; a rerun resumes). Needs DATABASE_URL and the R2_* storage
+// variables — run it on the worker machine, which has both:
+//
+//	fly ssh console -a esf-plate-worker -C "plate checksums status"
+func checksums(log *slog.Logger) error {
+	usage := fmt.Errorf("usage: plate checksums <status|run> [--rate-mbps 16] [--max N]")
+	if len(os.Args) < 3 {
+		return usage
+	}
+	sub := os.Args[2]
+	fs := flag.NewFlagSet("checksums", flag.ExitOnError)
+	rate := fs.Float64("rate-mbps", float64(worker.DefaultChecksumRate)/(1<<20), "read throughput cap in MiB/s (0 = unthrottled)")
+	max := fs.Int("max", 0, "stop after this many objects (0 = until none remain)")
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		return err
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return fmt.Errorf("DATABASE_URL is required")
+	}
+	st, err := store.Open(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	report := func() error {
+		b, err := st.ChecksumBacklogStatus(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("live=%d verified_sha256=%d pending=%d pending_bytes=%d (%.1f GiB) attempted_and_failed=%d\n",
+			b.Live, b.Verified, b.Pending, b.PendingBytes, float64(b.PendingBytes)/(1<<30), b.Attempted)
+		return nil
+	}
+
+	switch sub {
+	case "status":
+		return report()
+	case "run":
+		sc, err := service.LoadStorage(ctx)
+		if err != nil {
+			return err
+		}
+		if sc.Storage == nil {
+			return fmt.Errorf("plate checksums run: storage is required (set R2_ENDPOINT / R2_DEFAULT_BUCKET / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY)")
+		}
+		bps := int64(*rate * (1 << 20))
+		if *rate <= 0 {
+			bps = -1
+		}
+		if err := report(); err != nil {
+			return err
+		}
+		cs := worker.NewChecksummer(st, sc.Storage, log, worker.ChecksumConfig{RateBytesPerSec: bps})
+		start := time.Now()
+		res, err := cs.RunPass(ctx, *max)
+		fmt.Printf("hashed=%d failed=%d mismatched=%d bytes=%d elapsed=%s\n",
+			res.Hashed, res.Failed, res.Mismatched, res.Bytes, time.Since(start).Round(time.Second))
+		if err != nil {
+			return err
+		}
+		return report()
+	default:
+		return usage
+	}
 }
 
 // parseDurationEnv reads a Go duration from an env var, falling back to def on

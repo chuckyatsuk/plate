@@ -47,13 +47,9 @@ func (p *Postgres) GetAsset(ctx context.Context, account, assetID string) (plate
 	// The predicate that carries the whole isolation guarantee: account AND id.
 	// A B-owned asset requested by A matches zero rows → ErrNotFound, which the
 	// service renders as a 404 that names nothing about B.
-	row := p.pool.QueryRow(ctx, `
-		SELECT id, account, kind, filename,
-		       vault_key, vault_checksum, vault_size_bytes,
-		       vault_width, vault_height, vault_duration_s, vault_codec, vault_container,
-		       created, deleted_at
-		FROM assets
-		WHERE account = $1 AND id = $2`, account, assetID)
+	row := p.pool.QueryRow(ctx, assetSelect+`
+		FROM assets a`+assetJoin+`
+		WHERE a.account = $1 AND a.id = $2`, account, assetID)
 	a, err := scanAsset(ctx, p.pool, row)
 	if err != nil {
 		return plate.Asset{}, err
@@ -67,14 +63,10 @@ func (p *Postgres) ListAssets(ctx context.Context, account, cursor string, limit
 	}
 	// Cursor is the last id of the previous page (ids are lexicographically
 	// ordered ULIDs). Scoped to account — there is no cross-account listing.
-	rows, err := p.pool.Query(ctx, `
-		SELECT id, account, kind, filename,
-		       vault_key, vault_checksum, vault_size_bytes,
-		       vault_width, vault_height, vault_duration_s, vault_codec, vault_container,
-		       created, deleted_at
-		FROM assets
-		WHERE account = $1 AND ($2 = '' OR id > $2)
-		ORDER BY id
+	rows, err := p.pool.Query(ctx, assetSelect+`
+		FROM assets a`+assetJoin+`
+		WHERE a.account = $1 AND ($2 = '' OR a.id > $2)
+		ORDER BY a.id
 		LIMIT $3`, account, cursor, limit+1)
 	if err != nil {
 		return plate.AssetPage{}, err
@@ -111,14 +103,16 @@ func (p *Postgres) ListAssets(ctx context.Context, account, cursor string, limit
 }
 
 func (p *Postgres) MarkAssetDeleted(ctx context.Context, account, assetID string) (plate.Asset, error) {
+	// The UPDATE runs in a CTE so the returned row goes through the same
+	// projection (and upload join) as every other asset read.
 	row := p.pool.QueryRow(ctx, `
-		UPDATE assets
-		SET deleted_at = now()
-		WHERE account = $1 AND id = $2
-		RETURNING id, account, kind, filename,
-		          vault_key, vault_checksum, vault_size_bytes,
-		          vault_width, vault_height, vault_duration_s, vault_codec, vault_container,
-		          created, deleted_at`, account, assetID)
+		WITH a AS (
+			UPDATE assets
+			SET deleted_at = now()
+			WHERE account = $1 AND id = $2
+			RETURNING *
+		)`+assetSelect+`
+		FROM a`+assetJoin, account, assetID)
 	return scanAsset(ctx, p.pool, row)
 }
 
@@ -166,61 +160,98 @@ func (p *Postgres) RevokeGrant(ctx context.Context, account, grantID string) (pl
 		RETURNING id, account, assets, recipient, created, expires, revoked_at`, account, grantID)
 }
 
-func (p *Postgres) CreateGrant(ctx context.Context, account string, req plate.GrantRequest) (plate.Grant, error) {
-	// Classify EVERY distinct requested id against the caller's account, in one
-	// snapshot. This is the write-side isolation check: a grant over another
-	// account's assets must be refused wholesale (spec Q3, "one grant per SET"),
-	// without revealing which id was foreign. Distinct ids, so a set that names
-	// the same asset twice is not mistaken for one naming a foreign asset.
-	//
-	//   live    — an asset row owned by the caller, not deleted;
-	//   gone    — owned but deleted (row still present until the sweep), OR
-	//             purged: no asset row anywhere, yet the caller's own finalized
-	//             ORIGINAL upload with that id exists (finalize turns the upload
-	//             id into the asset id, and upload rows are never removed);
-	//   refused — anything else: another account's asset, or an id that never
-	//             existed. Indistinguishable by design.
+// assetClass is how one requested id relates to the caller's account when a
+// capability (a grant or an export) is issued over a set of ids.
+type assetClass int
+
+const (
+	// classRefused: another account's asset, or an id that never existed.
+	// Indistinguishable by design — either refuses the whole set, no id named.
+	classRefused assetClass = iota
+	// classLive: an asset row owned by the caller, not deleted.
+	classLive
+	// classGone: owned but deleted (row still present until the sweep), OR
+	// purged — see purgedSQL.
+	classGone
+)
+
+type classifiedID struct {
+	id    string
+	class assetClass
+}
+
+// purgedSQL is THE test for "this id was once an asset of account $1 that the
+// deleted-asset sweep has since purged": no asset row remains anywhere, yet the
+// account's own finalized ORIGINAL upload with that id exists (finalize turns
+// the upload id into the asset id, and upload rows are never removed). idExpr
+// is the SQL expression for the id; the account must be bound as $1. Shared by
+// the set classification (grants, exports) and AssetPurged (delivery), so the
+// three can never disagree about what "purged" means.
+func purgedSQL(idExpr string) string {
+	return `(NOT EXISTS (SELECT 1 FROM assets x WHERE x.id = ` + idExpr + `)
+		 AND EXISTS (SELECT 1 FROM uploads u
+		             WHERE u.account = $1 AND u.id = ` + idExpr + `
+		               AND u.finalized_at IS NOT NULL
+		               AND u.rendition_asset IS NULL))`
+}
+
+// classifyAssetSet classifies every DISTINCT requested id against the caller's
+// account in one snapshot, ordered by id. This is the write-side isolation
+// check for every capability issued over a set: a set naming another account's
+// asset must be refused wholesale (spec Q3, "one grant per SET") without
+// revealing which id was foreign. Distinct ids, so a set that names the same
+// asset twice is not mistaken for one naming a foreign asset.
+func (p *Postgres) classifyAssetSet(ctx context.Context, account string, ids []string) ([]classifiedID, error) {
 	rows, err := p.pool.Query(ctx, `
 		SELECT r.id,
-		       a.id IS NOT NULL                          AS owned,
-		       a.deleted_at IS NOT NULL                  AS deleted,
-		       (a.id IS NULL
-		        AND NOT EXISTS (SELECT 1 FROM assets x WHERE x.id = r.id)
-		        AND EXISTS (SELECT 1 FROM uploads u
-		                    WHERE u.account = $1 AND u.id = r.id
-		                      AND u.finalized_at IS NOT NULL
-		                      AND u.rendition_asset IS NULL)) AS purged
+		       a.id IS NOT NULL         AS owned,
+		       a.deleted_at IS NOT NULL AS deleted,
+		       `+purgedSQL("r.id")+`   AS purged
 		FROM (SELECT DISTINCT unnest($2::text[]) AS id) r
 		LEFT JOIN assets a ON a.id = r.id AND a.account = $1
-		ORDER BY r.id`, account, req.Assets)
+		ORDER BY r.id`, account, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []classifiedID
+	for rows.Next() {
+		var (
+			c                      classifiedID
+			owned, deleted, purged bool
+		)
+		if err := rows.Scan(&c.id, &owned, &deleted, &purged); err != nil {
+			return nil, err
+		}
+		switch {
+		case owned && deleted, purged:
+			c.class = classGone
+		case owned:
+			c.class = classLive
+		default:
+			c.class = classRefused
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) CreateGrant(ctx context.Context, account string, req plate.GrantRequest) (plate.Grant, error) {
+	// Live and gone ids are both the caller's: the grant covers the full
+	// requested set, and the gone ones (deleted or purged) are reported so the
+	// caller knows they will resolve `deleted`. Any refused id refuses the set.
+	classes, err := p.classifyAssetSet(ctx, account, req.Assets)
 	if err != nil {
 		return plate.Grant{}, err
 	}
 	var gone []string
-	refused := false
-	for rows.Next() {
-		var (
-			aid                    string
-			owned, deleted, purged bool
-		)
-		if err := rows.Scan(&aid, &owned, &deleted, &purged); err != nil {
-			rows.Close()
-			return plate.Grant{}, err
+	for _, c := range classes {
+		switch c.class {
+		case classRefused:
+			return plate.Grant{}, ErrForeignAsset
+		case classGone:
+			gone = append(gone, c.id)
 		}
-		switch {
-		case owned && deleted, purged:
-			gone = append(gone, aid)
-		case owned:
-		default:
-			refused = true
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return plate.Grant{}, err
-	}
-	if refused {
-		return plate.Grant{}, ErrForeignAsset
 	}
 
 	gid := id.New()
@@ -240,15 +271,11 @@ func (p *Postgres) CreateGrant(ctx context.Context, account string, req plate.Gr
 	return g, nil
 }
 
-// AssetPurged: see the interface doc. Same purged test as CreateGrant's.
+// AssetPurged: see the interface doc. Same purged test as the set
+// classification (purgedSQL).
 func (p *Postgres) AssetPurged(ctx context.Context, account, assetID string) (bool, error) {
 	var purged bool
-	err := p.pool.QueryRow(ctx, `
-		SELECT NOT EXISTS (SELECT 1 FROM assets WHERE id = $2)
-		   AND EXISTS (SELECT 1 FROM uploads
-		               WHERE account = $1 AND id = $2
-		                 AND finalized_at IS NOT NULL
-		                 AND rendition_asset IS NULL)`, account, assetID).Scan(&purged)
+	err := p.pool.QueryRow(ctx, `SELECT `+purgedSQL("$2"), account, assetID).Scan(&purged)
 	return purged, err
 }
 
@@ -298,26 +325,58 @@ func (p *Postgres) RevokeExport(ctx context.Context, account, exportID string) (
 }
 
 func (p *Postgres) CreateExport(ctx context.Context, account string, req plate.ExportRequest) (plate.Export, error) {
-	// Same write-side isolation check as CreateGrant: EVERY asset in the set must
-	// belong to the caller; refuse wholesale without revealing which was foreign.
-	var owned int
-	err := p.pool.QueryRow(ctx, `
-		SELECT count(*) FROM assets
-		WHERE account = $1 AND id = ANY($2)`, account, req.Assets).Scan(&owned)
+	// Same classification as CreateGrant (classifyAssetSet): a foreign or
+	// never-existed id refuses the whole set with the same indistinguishable
+	// ErrForeignAsset. Unlike a grant, an export is a route to ORIGINAL BYTES, so
+	// a gone asset is not carried in the frozen set at all: there are no bytes
+	// to hand out (purged) or the owner has said they must not leave (deleted).
+	// Gone ids are reported in GoneAssets instead. The frozen set is the live
+	// ids, each once, in request order.
+	classes, err := p.classifyAssetSet(ctx, account, req.Assets)
 	if err != nil {
 		return plate.Export{}, err
 	}
-	if owned != len(req.Assets) {
-		return plate.Export{}, ErrForeignAsset
+	class := make(map[string]assetClass, len(classes))
+	for _, c := range classes {
+		if c.class == classRefused {
+			return plate.Export{}, ErrForeignAsset
+		}
+		class[c.id] = c.class
+	}
+	var live, gone []string
+	seen := make(map[string]bool, len(req.Assets))
+	for _, aid := range req.Assets {
+		if seen[aid] {
+			continue
+		}
+		seen[aid] = true
+		if class[aid] == classLive {
+			live = append(live, aid)
+		} else {
+			gone = append(gone, aid)
+		}
+	}
+	if len(live) == 0 {
+		// Every requested id is the caller's and every one is gone: there is
+		// nothing an export could serve, and an empty frozen set is not an
+		// export. A named refusal, not a 403 — these are the caller's own ids.
+		return plate.Export{}, ErrAssetsGone
 	}
 
 	eid := id.New()
 	created := time.Now().UTC()
-	return scanExportRow(p.pool.QueryRow(ctx, `
+	e, err := scanExportRow(p.pool.QueryRow(ctx, `
 		INSERT INTO exports (id, account, assets, note, created, expires)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, account, assets, note, created, expires, revoked_at`,
-		eid, account, req.Assets, req.Note, created, req.Expires))
+		eid, account, live, req.Note, created, req.Expires))
+	if err != nil {
+		return plate.Export{}, err
+	}
+	if len(gone) > 0 {
+		e.GoneAssets = &gone
+	}
+	return e, nil
 }
 
 // ResolveExportForDelivery resolves an export BY ID for the download byte edge.
@@ -599,13 +658,9 @@ func (p *Postgres) MarkUploadSwept(ctx context.Context, uploadID string) error {
 // getAssetTx reads an account-scoped asset within a transaction (used by
 // finalize so the created asset is read in the same tx).
 func (p *Postgres) getAssetTx(ctx context.Context, tx pgx.Tx, account, assetID string) (plate.Asset, error) {
-	row := tx.QueryRow(ctx, `
-		SELECT id, account, kind, filename,
-		       vault_key, vault_checksum, vault_size_bytes,
-		       vault_width, vault_height, vault_duration_s, vault_codec, vault_container,
-		       created, deleted_at
-		FROM assets
-		WHERE account = $1 AND id = $2`, account, assetID)
+	row := tx.QueryRow(ctx, assetSelect+`
+		FROM assets a`+assetJoin+`
+		WHERE a.account = $1 AND a.id = $2`, account, assetID)
 	a, err := scanAssetRow(row)
 	if err != nil {
 		return plate.Asset{}, err
@@ -644,12 +699,32 @@ func scanAsset(ctx context.Context, pool *pgxpool.Pool, row pgx.Row) (plate.Asse
 	return a, nil
 }
 
+// assetSelect is the ONE projection every asset read uses, over an `a` that is
+// the assets table (or a CTE of its rows) joined by assetJoin. Keeping it in one
+// place is what stops a field (content_type, checksum_verified) from appearing
+// on one read path and silently missing from another.
+const assetSelect = `
+		SELECT a.id, a.account, a.kind, a.filename,
+		       a.vault_key, a.vault_checksum, a.checksum_verified, a.vault_size_bytes,
+		       a.vault_width, a.vault_height, a.vault_duration_s, a.vault_codec, a.vault_container,
+		       a.created, a.deleted_at, u.content_type`
+
+// assetJoin attaches the asset's own ORIGINAL upload row, the only place Plate
+// records the declared content type (finalize turns the upload id into the
+// asset id). The declared type is bound into the presigned PUT's signature, so
+// it is the stored object's Content-Type, not a later claim. Same account as the
+// asset, so the join cannot widen scope; an asset with no upload row (seeded
+// directly, never brokered) simply has no content_type.
+const assetJoin = `
+		LEFT JOIN uploads u ON u.id = a.id AND u.account = a.account AND u.rendition_asset IS NULL`
+
 func scanAssetRow(row rowScanner) (plate.Asset, error) {
 	var (
 		a         plate.Asset
 		filename  *string
 		vkey      string
 		vchecksum string
+		vverified bool
 		vsize     int64
 		vwidth    *int32
 		vheight   *int32
@@ -657,10 +732,11 @@ func scanAssetRow(row rowScanner) (plate.Asset, error) {
 		vcodec    *string
 		vcont     *string
 		deletedAt *time.Time
+		ctype     *string
 	)
 	err := row.Scan(&a.Id, &a.Account, &a.Kind, &filename,
-		&vkey, &vchecksum, &vsize, &vwidth, &vheight, &vdur, &vcodec, &vcont,
-		&a.Created, &deletedAt)
+		&vkey, &vchecksum, &vverified, &vsize, &vwidth, &vheight, &vdur, &vcodec, &vcont,
+		&a.Created, &deletedAt, &ctype)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return plate.Asset{}, ErrNotFound
 	}
@@ -669,15 +745,17 @@ func scanAssetRow(row rowScanner) (plate.Asset, error) {
 	}
 	a.Filename = filename
 	a.DeletedAt = deletedAt
+	a.ContentType = ctype
 	a.Vault = plate.VaultObject{
-		Key:       vkey,
-		Checksum:  vchecksum,
-		SizeBytes: vsize,
-		Width:     vwidth,
-		Height:    vheight,
-		DurationS: vdur,
-		Codec:     vcodec,
-		Container: vcont,
+		Key:              vkey,
+		Checksum:         vchecksum,
+		ChecksumVerified: vverified,
+		SizeBytes:        vsize,
+		Width:            vwidth,
+		Height:           vheight,
+		DurationS:        vdur,
+		Codec:            vcodec,
+		Container:        vcont,
 	}
 	a.Renditions = []plate.Rendition{}
 	return a, nil
