@@ -5,7 +5,7 @@
 # Production successor to deploy/fly.toml (plate-demo-worker). Differences:
 #   - app = "plate-worker" (was plate-demo-worker)
 #   - NO PLATE_ALLOW_THROWAWAY_KEYS — prod keypair; the boot guard stays armed.
-#   - R2_DEFAULT_BUCKET = plate (secret, below).
+#   - R2_DEFAULT_BUCKET = plate ([env], below).
 #
 # Deploy + keep one machine up (the process group is "worker", not "app"):
 #   fly deploy . -a esf-plate-worker -c deploy/fly.worker.plate.toml
@@ -39,13 +39,16 @@ primary_region = "iad"  # co-locate with the Postgres region (grant/queue lookup
 # Scratch: prefer the machine's ephemeral disk over a Fly Volume (a Volume bills
 # whether attached or not). PLATE_WORKER_SCRATCH_DIR is set in the image.
 
-# Secrets (set with `fly secrets set -a esf-plate-worker …`, NEVER committed):
+# Secrets are NEVER in this file. These three live in Infisical (project `plate`,
+# env `prod`) and are pushed to Fly with ~/Dev/registry/scripts/secrets/infisical-to-fly.sh;
+# never `fly secrets set` a value by hand. See docs/SECRETS.md.
 #   DATABASE_URL   — the IPv4 SESSION pooler DSN (postgres.<ref>@aws-0-…pooler:5432,
 #                    ?sslmode=require). The direct db.<ref>.supabase.co host is IPv6-ONLY;
 #                    the worker's SKIP LOCKED needs session semantics, which the 5432
 #                    session pooler (NOT the 6543 txn pooler) preserves.
-#   R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_REGION   (same account as demo)
-#   R2_DEFAULT_BUCKET = plate    ⚠️ the NEW prod bucket (NOT plate-demo)
+#   R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY   the R2 write credential
+# The R2 config (endpoint, region, bucket) is in [env] below and MUST equal the API's.
+# A Fly secret with the same name as an [env] key OVERRIDES it silently.
 # The worker needs NO JWT/delivery/imgproxy keys — it pulls jobs + writes renditions;
 # it never validates tokens or mints delivery URLs. ffmpeg/ffprobe are on PATH in the
 # image (no PLATE_FFMPEG_PATH needed).
@@ -58,3 +61,9 @@ primary_region = "iad"  # co-locate with the Postgres region (grant/queue lookup
   # NO PLATE_ALLOW_THROWAWAY_KEYS (unlike the demo): the worker builds the service
   # from the same key material as the API, so it hits the same boot guard — and prod
   # keeps it ARMED on a freshly generated keypair (Phase B).
+
+  # R2 (same account as the demo; the keys are secrets, above). The prod `plate`
+  # bucket, NOT plate-demo. Same values as deploy/fly.api.plate.toml (tested).
+  R2_ENDPOINT = "https://87c7daae690b39a2efedf6ef10773606.r2.cloudflarestorage.com"
+  R2_REGION = "auto"
+  R2_DEFAULT_BUCKET = "plate"

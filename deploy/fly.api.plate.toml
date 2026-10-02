@@ -8,9 +8,10 @@
 #   - app = "plate-api" (was plate-demo-api)
 #   - NO PLATE_ALLOW_THROWAWAY_KEYS — prod uses the real Phase-B keypair; the
 #     known-throwaway-key boot guard MUST be armed (a real client on real keys).
-#   - Secrets carry the `plate` bucket + plate-media/plate-img hosts (see checklist).
+#   - [env] carries the `plate` bucket + plate-media/plate-img hosts (below).
 #
-# ⚠️ Secrets are set with `fly secrets set` (NEVER committed). See the checklist below.
+# ⚠️ Secrets are NEVER committed. They live in Infisical and are pushed to Fly with a
+# script; see the checklist at the end and docs/SECRETS.md.
 
 app = "esf-plate-api"
 primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download grant
@@ -30,6 +31,30 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
   # NO PLATE_ALLOW_THROWAWAY_KEYS here (unlike the demo): prod runs on a freshly
   # generated keypair (Phase B), so the throwaway-key boot guard stays ARMED. Setting
   # it would defeat the guard that protects a real client's credential.
+
+  # Delivery hosts. The public image host is the CDN-fronted presets-only imgproxy
+  # (Cloudflare → esf-plate-imgproxy.fly.dev, cache rule): PUBLIC image URLs only.
+  # Granted (expiring) image URLs go to the separate pr+exp imgproxy
+  # (deploy/fly.imgproxy-granted.plate.toml); it MUST differ from the public host
+  # (boot refuses). R2_PUBLIC_BASE is the `plate` bucket's A/V public custom domain
+  # (loops/details/original bytes); PLATE_DOWNLOAD_BASE is this API's own public base.
+  IMGPROXY_BASE_URL = "https://plate-img.everysinglefile.com"
+  IMGPROXY_GRANTED_BASE_URL = "https://esf-plate-imgproxy-granted.fly.dev"
+  R2_PUBLIC_BASE = "https://plate-media.everysinglefile.com"
+  PLATE_DOWNLOAD_BASE = "https://plate-api.everysinglefile.com"
+  PLATE_GRANTED_URL_TTL = "90s"  # granted URL lifetime; boot refuses anything over 120s
+
+  # R2 (same account as the demo; the keys are secrets, below). The bucket is the
+  # prod `plate` bucket, NOT plate-demo.
+  R2_ENDPOINT = "https://87c7daae690b39a2efedf6ef10773606.r2.cloudflarestorage.com"
+  R2_REGION = "auto"
+  R2_DEFAULT_BUCKET = "plate"
+
+  # Token policy. A security guard: with `true` the API refuses to boot while any
+  # trusted key in PLATE_JWT_PUBLIC_KEYS has no account binding in
+  # PLATE_JWT_KEY_ACCOUNTS (an unbound key could sign for ANY account). Committed
+  # here so that turning it off is a reviewed change, not a quiet `fly secrets` edit.
+  PLATE_JWT_REQUIRE_KEY_BINDING = "true"
 
 # Public HTTP service. Unlike the worker, the API serves requests — presign,
 # finalize, resolve, and the /v1/download redirect.
@@ -60,34 +85,20 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
   size = "shared-cpu-1x"
   memory = "512mb"
 
-# ── Secrets checklist (fly secrets set -a esf-plate-api …) ───────────────────────
-# Required (API 503s the write path / denies tokens without these):
+# ── Secrets checklist ─────────────────────────────────────────────────────────
+# Secrets are NEVER in this file. These eight live in Infisical (project `plate`,
+# env `prod`) and are pushed to Fly with ~/Dev/registry/scripts/secrets/infisical-to-fly.sh;
+# never `fly secrets set` a value by hand. See docs/SECRETS.md.
 #   DATABASE_URL                 the IPv4 SESSION pooler DSN (direct host is IPv6-only)
-#   R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_REGION   (same account as demo)
-#   R2_DEFAULT_BUCKET = plate    ⚠️ the NEW prod bucket (NOT plate-demo)
-#   PLATE_JWT_PUBLIC_KEYS        named-key set `kid=<b64pub> …` — set in PHASE B2 with
-#                                BOTH files-20260914 (demo self-mint) AND uri-YYYYMMDD
-#                                (the client). EMPTY until B2 → API denies all tokens
-#                                (expected, see the readyz note above).
-#   PLATE_JWT_KEY_ACCOUNTS       OPTIONAL key → account binding `kid=<account>|<prefix>*,…`
-#                                (`@legacy` = the no-kid key). Unset = every key may claim
-#                                any account (unchanged).
-#   PLATE_JWT_REQUIRE_KEY_BINDING OPTIONAL `true` = refuse boot while any trusted key is unbound.
-# Delivery (granted/signed/original — set so the byte edge is enforceable):
-#   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download — a REAL prod secret (A2),
-#                                NOT the demo throwaway
-#   IMGPROXY_KEY IMGPROXY_SALT   hex — REAL prod values (A2); MUST match esf-plate-imgproxy
-#   IMGPROXY_BASE_URL = https://plate-img.everysinglefile.com   the CDN-fronted imgproxy
-#                                host (Cloudflare → esf-plate-imgproxy.fly.dev, cache rule).
-#                                PUBLIC image URLs only (presets-only imgproxy).
-#   IMGPROXY_GRANTED_BASE_URL = https://esf-plate-imgproxy-granted.fly.dev   GRANTED
-#                                (expiring) image URLs — the separate pr+exp imgproxy
-#                                (deploy/fly.imgproxy-granted.plate.toml). MUST differ
-#                                from IMGPROXY_BASE_URL (boot refuses). Unset ⇒ granted
-#                                images 503 `unconfigured` (fail closed).
-#   R2_PUBLIC_BASE   = https://plate-media.everysinglefile.com  the `plate` bucket's A/V
-#                                public custom domain (loops/details/original bytes).
-#   PLATE_DOWNLOAD_BASE = https://esf-plate-api.fly.dev             this API's own public base.
-# Optional tunables (safe defaults):
-#   PLATE_GRANTED_URL_TTL (<=120s), PLATE_GRANT_CACHE_TTL, PLATE_UPLOAD_URL_TTL,
-#   PLATE_JWT_ISSUER, PLATE_JWT_AUDIENCE
+#   R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY   the R2 write credential
+#   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download
+#   IMGPROXY_KEY IMGPROXY_SALT   hex; MUST match esf-plate-imgproxy and
+#                                esf-plate-imgproxy-granted
+#   PLATE_JWT_PUBLIC_KEYS        the trusted named-key set `kid=<b64pub>,…` (the current
+#                                kids are in Infisical)
+#   PLATE_JWT_KEY_ACCOUNTS       key → account binding `kid=<account>|<prefix>*,…`; every
+#                                trusted kid needs one (PLATE_JWT_REQUIRE_KEY_BINDING above)
+# Config is in [env] above. A Fly secret with the same name OVERRIDES it silently,
+# so none of the [env] names may also exist as a Fly secret.
+# Optional tunables (safe defaults, not set):
+#   PLATE_GRANT_CACHE_TTL, PLATE_UPLOAD_URL_TTL, PLATE_JWT_ISSUER, PLATE_JWT_AUDIENCE
