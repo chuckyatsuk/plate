@@ -81,17 +81,14 @@ primary_region = "iad"  # same region as the API and the public imgproxy
   memory = "512mb"
 
 # ── Secrets ──────────────────────────────────────────────────────────────────────
-# Secrets are NEVER in this file. The values live in Infisical (project `plate`, env
-# `prod`) and are pushed with ~/Dev/registry/scripts/secrets/infisical-to-fly.sh, using
-# the NAME:FLYNAME mapping for the R2 pair; never `fly secrets set` a value by hand.
-# See docs/SECRETS.md.
-#   sh ~/Dev/registry/scripts/secrets/infisical-to-fly.sh 8d235b61-b9c9-4754-9bdc-73cc7db55c05 prod esf-plate-imgproxy-granted \
-#     IMGPROXY_KEY IMGPROXY_SALT R2_ACCESS_KEY_ID:AWS_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY:AWS_SECRET_ACCESS_KEY
+# Secrets are NEVER in this file. The values live in your secrets manager and are
+# pushed to Fly with `fly secrets import`, the R2 pair under the AWS_* names below;
+# never `fly secrets set` a value by hand. See docs/SECRETS.md.
 # Same values as esf-plate-imgproxy — imgproxy MUST be keyed or it serves unsigned
 # (/unsafe/) URLs, and the key/salt MUST match the API's or Plate's signatures fail:
 #   IMGPROXY_KEY   (hex)  — same value as on esf-plate-api
 #   IMGPROXY_SALT  (hex)  — same value as on esf-plate-api
-#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY ← Infisical R2_ACCESS_KEY_ID /
-#     R2_SECRET_ACCESS_KEY — R2 READ on vault/* of `plate`
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY ← the R2_ACCESS_KEY_ID /
+#     R2_SECRET_ACCESS_KEY values — R2 READ on vault/* of `plate`
 # Sharing the key is safe: a public URL sent here and a granted URL sent to the
 # public host are both rejected by the parser (no shape is valid in both modes).
