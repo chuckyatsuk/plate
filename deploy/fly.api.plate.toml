@@ -10,8 +10,8 @@
 #     known-throwaway-key boot guard MUST be armed (a real client on real keys).
 #   - [env] carries the `plate` bucket + plate-media/plate-img hosts (below).
 #
-# ⚠️ Secrets are NEVER committed. They live in Infisical and are pushed to Fly with a
-# script; see the checklist at the end and docs/SECRETS.md.
+# ⚠️ Secrets are NEVER committed. Keep them in a secrets manager and push them to Fly
+# with `fly secrets import`; see the checklist at the end and docs/SECRETS.md.
 
 app = "esf-plate-api"
 primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download grant
@@ -71,9 +71,7 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
                                  # (pulls the machine from routing); worker-heartbeat / no-progress
                                  # problems are 200 "degraded" so a dead worker never unroutes the
                                  # API. The EXTERNAL monitor alerts on non-200 OR status != ok.
-                                 # NOTE (Tier 4): between deploy and Phase B2, the API has NO JWT key
-                                 # material and 401s every token — that is EXPECTED and does NOT affect
-                                 # readyz (token validation is not a readyz check). readyz is 200/ok.
+                                 # Token validation is not a readyz check.
     interval = "15s"
     timeout = "3s"
     grace_period = "10s"
@@ -86,16 +84,15 @@ primary_region = "iad"  # co-locate with Supabase (us-east-1) — the /download 
   memory = "512mb"
 
 # ── Secrets checklist ─────────────────────────────────────────────────────────
-# Secrets are NEVER in this file. These eight live in Infisical (project `plate`,
-# env `prod`) and are pushed to Fly with ~/Dev/registry/scripts/secrets/infisical-to-fly.sh;
-# never `fly secrets set` a value by hand. See docs/SECRETS.md.
+# Secrets are NEVER in this file. These eight live in your secrets manager and are
+# pushed to Fly with `fly secrets import`; never `fly secrets set` a value by hand.
+# See docs/SECRETS.md.
 #   DATABASE_URL                 the IPv4 SESSION pooler DSN (direct host is IPv6-only)
 #   R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY   the R2 write credential
 #   PLATE_DELIVERY_SIGNING_KEY   HMAC secret for /v1/download
 #   IMGPROXY_KEY IMGPROXY_SALT   hex; MUST match esf-plate-imgproxy and
 #                                esf-plate-imgproxy-granted
-#   PLATE_JWT_PUBLIC_KEYS        the trusted named-key set `kid=<b64pub>,…` (the current
-#                                kids are in Infisical)
+#   PLATE_JWT_PUBLIC_KEYS        the trusted named-key set `kid=<b64pub>,…`
 #   PLATE_JWT_KEY_ACCOUNTS       key → account binding `kid=<account>|<prefix>*,…`; every
 #                                trusted kid needs one (PLATE_JWT_REQUIRE_KEY_BINDING above)
 # Config is in [env] above. A Fly secret with the same name OVERRIDES it silently,

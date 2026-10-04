@@ -154,7 +154,7 @@ func LoadEnv() (EnvConfig, error) {
 		// Refuse to boot on a KNOWN-THROWAWAY key (the demo/smoke keypair) unless
 		// the operator explicitly opts in with PLATE_ALLOW_THROWAWAY_KEYS=true.
 		// This keeps a demo key from silently reaching a real deployment: the demo
-		// sets the flag deliberately; prod never does, so a copied .env fails loud
+		// sets the flag deliberately; prod never does, so a copied demo config fails loud
 		// at boot instead of accepting tokens signed by a key whose private half is
 		// in a scratch file.
 		if isThrowawayKey(legacyStr) && os.Getenv("PLATE_ALLOW_THROWAWAY_KEYS") != "true" {
@@ -325,8 +325,8 @@ var knownThrowawayKeys = map[string]bool{
 	"9SRBsqY2/qVTTwxviZ5GiTFKmxu8DY14lIZ0W890RwU=": true,
 
 	// The 2026-09-10 demo keypair, deployed on plate-demo-api after the rotation.
-	// It is a DEMO key: its private half is held in ~/Dev/plate/.env (gitignored,
-	// but a loose private half a token could be minted from), so by this list's
+	// It is a DEMO key: its private half sits outside a vault (a loose private
+	// half a token could be minted from), so by this list's
 	// rule it is throwaway-class. The demo opts past the guard with
 	// PLATE_ALLOW_THROWAWAY_KEYS=true; a real prod deployment must generate its own
 	// keypair and must NOT set that flag (a copied demo config then fails boot).

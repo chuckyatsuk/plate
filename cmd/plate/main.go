@@ -145,7 +145,7 @@ var knownScopes = map[string]bool{
 // the same posture as `plate accounts create`. Issuance is separable from
 // validation (spec Q3): the deployed SERVICE holds only the public key and never
 // mints; this command signs with the PRIVATE key, which the operator supplies via
-// PLATE_JWT_PRIVATE_B64 (base64 of the Ed25519 private key, as in ~/Dev/plate/.env).
+// PLATE_JWT_PRIVATE_B64 (base64 of the Ed25519 private key; see docs/SECRETS.md).
 // It never touches the database and never runs on the server.
 //
 // The token is a bounded credential: it always carries an expiry (--ttl), so a
@@ -193,7 +193,7 @@ func mintToken() error {
 
 	privB64 := os.Getenv("PLATE_JWT_PRIVATE_B64")
 	if privB64 == "" {
-		return fmt.Errorf("PLATE_JWT_PRIVATE_B64 is required (base64 of the Ed25519 private key; operator-held, e.g. ~/Dev/plate/.env)")
+		return fmt.Errorf("PLATE_JWT_PRIVATE_B64 is required (base64 of the Ed25519 private key that signs tokens; supply it from your secrets manager, see docs/SECRETS.md)")
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privB64))
 	if err != nil {

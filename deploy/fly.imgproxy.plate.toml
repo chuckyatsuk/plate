@@ -71,19 +71,16 @@ primary_region = "iad"  # near the API + Supabase; imgproxy fetches originals ov
   memory = "512mb"
 
 # ── Secrets ──────────────────────────────────────────────────────────────────────
-# Secrets are NEVER in this file. The values live in Infisical (project `plate`, env
-# `prod`) and are pushed with ~/Dev/registry/scripts/secrets/infisical-to-fly.sh, using
-# the NAME:FLYNAME mapping for the R2 pair; never `fly secrets set` a value by hand.
-# See docs/SECRETS.md.
-#   sh ~/Dev/registry/scripts/secrets/infisical-to-fly.sh 8d235b61-b9c9-4754-9bdc-73cc7db55c05 prod esf-plate-imgproxy \
-#     IMGPROXY_KEY IMGPROXY_SALT R2_ACCESS_KEY_ID:AWS_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY:AWS_SECRET_ACCESS_KEY
+# Secrets are NEVER in this file. The values live in your secrets manager and are
+# pushed to Fly with `fly secrets import`, the R2 pair under the AWS_* names below;
+# never `fly secrets set` a value by hand. See docs/SECRETS.md.
 # 1. Signing — MUST match the API's IMGPROXY_KEY / IMGPROXY_SALT, or imgproxy runs
 #    unsafe and Plate's signed URLs won't verify:
 #      IMGPROXY_KEY   (hex)  — same value as on esf-plate-api
 #      IMGPROXY_SALT  (hex)  — same value as on esf-plate-api
 # 2. R2 credentials for the private S3 origin (AWS-standard names imgproxy reads):
-#      AWS_ACCESS_KEY_ID       ← Infisical R2_ACCESS_KEY_ID
-#      AWS_SECRET_ACCESS_KEY   ← Infisical R2_SECRET_ACCESS_KEY
+#      AWS_ACCESS_KEY_ID       ← the R2_ACCESS_KEY_ID value
+#      AWS_SECRET_ACCESS_KEY   ← the R2_SECRET_ACCESS_KEY value
 #    Scope: this token needs READ on vault/* of the `plate` bucket (imgproxy only reads
 #    originals).
 #

@@ -1,7 +1,7 @@
 package service
 
 // The production config is committed in the deploy manifests' [env]; the secrets
-// live in Infisical and reach Fly as Fly secrets (docs/SECRETS.md). This file pins
+// live in a secrets manager and reach Fly as Fly secrets (docs/SECRETS.md). This file pins
 // both halves against the COMMITTED manifests: every config value Plate needs is
 // in [env] and passes LoadEnv's own checks, and no secret name is ever assigned
 // in any manifest.
@@ -36,7 +36,7 @@ var apiEnvConfigNames = []string{
 // The R2 config the worker reads from [env]; it must equal the API's.
 var workerEnvConfigNames = []string{"R2_DEFAULT_BUCKET", "R2_ENDPOINT", "R2_REGION"}
 
-// The secrets: exactly the names in Infisical `plate`/`prod`. None may be
+// The secrets: exactly the names docs/SECRETS.md lists. None may be
 // assigned in a committed manifest.
 var plateSecretNames = []string{
 	"DATABASE_URL",
@@ -113,7 +113,7 @@ func TestDeployEnv_NoSecretAssigned(t *testing.T) {
 		}
 		for _, n := range plateSecretNames {
 			if regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(n) + `\s*=`).Match(raw) {
-				t.Errorf("%s assigns the secret %s; secrets live in Infisical (docs/SECRETS.md), never in a manifest", path, n)
+				t.Errorf("%s assigns the secret %s; secrets live in a secrets manager (docs/SECRETS.md), never in a manifest", path, n)
 			}
 		}
 	}
