@@ -28,13 +28,25 @@ primary_region = "iad"  # co-locate with the Postgres region (grant/queue lookup
 # orphaned R2 objects and marked-deleted bytes accumulate forever with no error. So
 # keep one machine always running (enforced at deploy with `fly scale count worker=1`).
 [[vm]]
-  # PERFORMANCE CPU, never shared: ffmpeg on a throttled shared vCPU crawls and would
-  # blow the duration ceilings. 2 perf CPU / 4GB — a 12-min derived source is ~30min of
-  # compute. Tier 4 note: Uri's backfill is AUTHORED (remux, seconds) + one tiny derive,
-  # so the perf machine is barely taxed — but it MUST stay perf-2x because live post-
-  # cutover uploads (V3 ingest) can still enqueue a real derived detail.
-  size = "performance-2x"
-  memory = "4gb"
+  # Sized for what this machine does almost all of the time: the queue poll and the
+  # reconciliation sweeps above, which need very little. It runs 24/7, so its size is
+  # the worker's whole standing cost.
+  #
+  # This size is NOT enough for a real derive. ffmpeg on a throttled shared vCPU
+  # crawls: measured on 2 performance CPUs / 4GB, a 12-minute derived source is about
+  # 30 minutes of compute, and here it would take far longer and may fail. An AUTHORED
+  # source (a remux, seconds) is fine at this size.
+  #
+  # Before ingesting video that needs a derive, scale up, and scale back afterwards:
+  #   fly scale vm performance-2x --memory 4096 -a <worker app>
+  #   fly scale vm shared-cpu-1x --memory 1024 -a <worker app>
+  # `fly scale vm` changes the running machine only; the next `fly deploy` applies the
+  # values below again.
+  #
+  # The lasting fix is to split the worker: a small always-on machine for the sweeps,
+  # and a performance machine that starts only when a derive is queued.
+  size = "shared-cpu-1x"
+  memory = "1gb"
 
 # Scratch: prefer the machine's ephemeral disk over a Fly Volume (a Volume bills
 # whether attached or not). PLATE_WORKER_SCRATCH_DIR is set in the image.
